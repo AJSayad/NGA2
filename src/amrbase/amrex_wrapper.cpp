@@ -14,6 +14,7 @@
 #include <AMReX_MLPoisson.H>
 #include <AMReX_MLABecLaplacian.H>
 #include <AMReX_MultiFab.H>
+#include <AMReX_iMultiFab.H>
 #include <AMReX_MultiFabUtil.H>
 #include <AMReX_PhysBCFunct.H>
 #include <AMReX_PlotFileUtil.H>
@@ -182,6 +183,48 @@ public:
     }
   }
 };
+
+//=============================================================================
+// Periodic ghost wrap for periodic directions narrower than the ghost width
+//=============================================================================
+
+// FillPatchTwoLevels and InterpFromCoarseLevel interpolate fine ghosts from a
+// temporary coarse patch that has no ghost cells of its own. That patch is
+// filled by a ParallelCopy whose periodic shifts come from
+// Periodicity::shiftIntVect with zero ghosts, i.e. one period either way only.
+// In a periodic direction narrower than the ghost width (the single z cell of
+// quasi-2D runs, where z is not refined), patch cells more than one period out
+// are never written, and the fine ghosts interpolated from them hold
+// uninitialized data. This copies every ghost of the first ng layers lying
+// outside the domain along such a direction from its periodic image inside the
+// domain, in the same FAB. The images are valid cells or ghosts within one
+// period, which the fill sets correctly, and the grown box spans the whole
+// period since the period is narrower than ng. No-op in directions that are
+// non-periodic or at least ng wide. dcomp is 0-indexed.
+void wrap_thin_periodic(amrex::MultiFab &mf, const amrex::Geometry &geom,
+                        int dcomp, int ncomp, const amrex::IntVect &ng) {
+  const amrex::Box &domain = geom.Domain();
+  for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+    const int np = domain.length(d);
+    if (!geom.isPeriodic(d) || np >= ng[d]) continue;
+    // In-domain index range along d (a nodal direction includes the periodic
+    // node dlo+np)
+    const int dlo = domain.smallEnd(d);
+    const int dhi = domain.bigEnd(d) + (mf.ixType().nodeCentered(d) ? 1 : 0);
+    for (amrex::MFIter mfi(mf); mfi.isValid(); ++mfi) {
+      const amrex::Box gbx = amrex::grow(mfi.validbox(), ng);
+      auto const &a = mf.array(mfi);
+      // Writes only cells outside the domain along d, reads only cells inside
+      amrex::ParallelFor(
+          gbx, ncomp, [=] AMREX_GPU_DEVICE(int i, int j, int k, int n) noexcept {
+            int s[3] = {i, j, k};
+            if (s[d] >= dlo && s[d] <= dhi) return;
+            s[d] = dlo + ((s[d] - dlo) % np + np) % np;
+            a(i, j, k, dcomp + n) = a(s[0], s[1], s[2], dcomp + n);
+          });
+    }
+  }
+}
 
 } // namespace nga2
 
@@ -455,6 +498,8 @@ void amrmfab_fillpatch_two(void *mf_ptr, double time_old_c, void *mf_old_c_ptr,
   amrex::FillPatchTwoLevels(*mf, ng, time, cmf, ctime, fmf, ftime, scomp - 1,
                             dcomp - 1, ncomp, *geom_c, *geom_f, bc_functor_c, 0,
                             bc_functor_f, 0, ratio, interp, bcs, 0);
+  // Ghosts more than one period out in thin periodic directions (quasi-2D z)
+  nga2::wrap_thin_periodic(*mf, *geom_f, dcomp - 1, ncomp, ng);
 }
 
 //-----------------------------------------------------------------------------
@@ -536,6 +581,8 @@ void amrmfab_fillcoarsepatch(void *mf_f_ptr, double time, void *mf_c_ptr,
   amrex::InterpFromCoarseLevel(*mf_f, time, *mf_c, scomp - 1, dcomp - 1, ncomp,
                                *geom_c, *geom_f, bc_functor_c, 0, bc_functor_f,
                                0, ratio, interp, bcs, 0);
+  // Ghosts more than one period out in thin periodic directions (quasi-2D z)
+  nga2::wrap_thin_periodic(*mf_f, *geom_f, dcomp - 1, ncomp, mf_f->nGrowVect());
 }
 
 //-----------------------------------------------------------------------------
@@ -566,6 +613,14 @@ void amrmask_make_fine(void *mask_ptr, void *ba_fine_ptr, int *ref_ratio,
   auto fine_mask = amrex::makeFineMask(*mask, *ba_fine, rr, notcovered_val, covered_val);
   // Copy result into provided mask
   amrex::iMultiFab::Copy(*mask, fine_mask, 0, 0, 1, 0);
+}
+
+// Fill integer MultiFab ghost cells, including periodic images.  AMReX's
+// Fortran iMultiFab wrapper does not currently expose FabArray::FillBoundary.
+void amrimultifab_fill_boundary(void *mf_ptr, void *geom_ptr) {
+  auto *mf = static_cast<amrex::iMultiFab *>(mf_ptr);
+  auto *geom = static_cast<amrex::Geometry *>(geom_ptr);
+  mf->FillBoundary(geom->periodicity());
 }
 
 //-----------------------------------------------------------------------------
@@ -1082,6 +1137,10 @@ void amrmfab_fillcoarsepatch_faces(
   } else {
     amrex::Abort("amrmfab_fillcoarsepatch_faces: unsupported interp_type");
   }
+  // Ghosts more than one period out in thin periodic directions (quasi-2D z)
+  for (auto *mf : mf_arr) {
+    nga2::wrap_thin_periodic(*mf, *geom_f, dcomp - 1, ncomp, mf->nGrowVect());
+  }
 }
 
 // FillPatch from two levels (used during regular FillPatch operations)
@@ -1178,6 +1237,10 @@ void amrmfab_fillpatch_two_faces(
                               &amrex::face_cons_linear_interp, bcs, 0);
   } else {
     amrex::Abort("amrmfab_fillpatch_two_faces: unsupported interp_type");
+  }
+  // Ghosts more than one period out in thin periodic directions (quasi-2D z)
+  for (auto *mf : mf_arr) {
+    nga2::wrap_thin_periodic(*mf, *geom_f, dcomp - 1, ncomp, ng);
   }
 }
 
@@ -1301,6 +1364,15 @@ void amrabeclap_build_c(amrex::MLLinOp *&linop, int nlevels,
 //-----------------------------------------------------------------------------
 // ParallelCopy with ADD semantics (for deposit accumulation across DMs)
 //-----------------------------------------------------------------------------
+
+// MFIter may only be shared by MultiFabs with identical boxes and owners.
+int amrmfab_same_layout(const void *a_ptr, const void *b_ptr) {
+  if (a_ptr == nullptr || b_ptr == nullptr) return 0;
+  const auto &a = *static_cast<const amrex::MultiFab *>(a_ptr);
+  const auto &b = *static_cast<const amrex::MultiFab *>(b_ptr);
+  return a.boxArray() == b.boxArray() &&
+         a.DistributionMap() == b.DistributionMap();
+}
 
 void amrmfab_parallel_add(void *dst_ptr, void *src_ptr,
                           int srccomp, int dstcomp, int ncomp,

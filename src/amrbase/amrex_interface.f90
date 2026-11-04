@@ -47,6 +47,7 @@ module amrex_interface
    ! FillPatch Operations
    !=====================================================================
    public :: amrmfab_parallel_add
+   public :: amrmfab_same_layout
    public :: amrmfab_fillpatch_single
    public :: amrmfab_fillpatch_two
    public :: amrmfab_fillcoarsepatch
@@ -93,6 +94,7 @@ module amrex_interface
    public :: amrmfab_compute_divergence ! Compute div(u) from face velocities
    public :: amrmfab_sum_unique         ! Sum for face/nodal data (no double-counting)
    public :: amrmask_make_fine          ! Create mask for cells covered by finer level
+   public :: amrimultifab_fill_boundary ! Fill integer MultiFab ghosts, including periodicity
 
    !=====================================================================
    ! Per-direction wrappers (bypass AMReX scalar-only Fortran interfaces)
@@ -580,6 +582,11 @@ module amrex_interface
       end subroutine amrmfab_average_down_node_c
 
       !> ParallelCopy with ADD semantics
+      integer(c_int) function amrmfab_same_layout(a,b) bind(c,name='amrmfab_same_layout')
+         import :: c_ptr,c_int
+         type(c_ptr), value :: a,b
+      end function amrmfab_same_layout
+
       subroutine amrmfab_parallel_add_c(dst,src,srccomp,dstcomp,ncomp,srcng,dstng,geom) &
       &  bind(c,name='amrmfab_parallel_add')
          import :: c_ptr,c_int
@@ -627,6 +634,12 @@ module amrex_interface
          integer(c_int), intent(in) :: ref_ratio(3)
          integer(c_int), value :: covered_val, notcovered_val
       end subroutine amrmask_make_fine_c
+
+      !> Fill integer MultiFab ghost cells using geometry periodicity
+      subroutine amrimultifab_fill_boundary_c(mf, geom) bind(c, name='amrimultifab_fill_boundary')
+         import :: c_ptr
+         type(c_ptr), value :: mf,geom
+      end subroutine amrimultifab_fill_boundary_c
 
    end interface
 
@@ -781,6 +794,14 @@ contains
       integer, intent(in) :: covered_val, notcovered_val
       call amrmask_make_fine_c(mask%p, ba_fine%p, ref_ratio, covered_val, notcovered_val)
    end subroutine amrmask_make_fine
+
+   !> Fill integer MultiFab ghost cells, including periodic images
+   subroutine amrimultifab_fill_boundary(mf,geom)
+      use amrex_amr_module, only: amrex_imultifab,amrex_geometry
+      type(amrex_imultifab), intent(inout) :: mf
+      type(amrex_geometry), intent(in) :: geom
+      call amrimultifab_fill_boundary_c(mf%p,geom%p)
+   end subroutine amrimultifab_fill_boundary
 
    !> Fill coarse patch for 3-component face-centered velocity
    subroutine amrmfab_fillcoarsepatch_faces(mf_u, mf_v, mf_w, time, &
@@ -976,4 +997,3 @@ contains
    end subroutine amrdm_make_sfc
 
 end module amrex_interface
-

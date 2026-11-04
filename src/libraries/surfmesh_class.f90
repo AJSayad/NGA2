@@ -10,11 +10,11 @@ module surfmesh_class
    !> Surface mesh object
    type :: surfmesh
       character(len=str_medium) :: name='UNNAMED_SURFMESH' !< Name for the surface mesh
-      integer :: nVert                                     !< Number of vertices
+      integer :: nVert=0                                   !< Number of vertices
       real(WP), dimension(:), allocatable :: xVert         !< X position of the vertices - size=nVert
       real(WP), dimension(:), allocatable :: yVert         !< Y position of the vertices - size=nVert
       real(WP), dimension(:), allocatable :: zVert         !< Z position of the vertices - size=nVert
-      integer :: nPoly                                     !< Number of polygons
+      integer :: nPoly=0                                   !< Number of polygons
       integer,  dimension(:), allocatable :: polySize      !< Size of polygons - size=nPoly
       integer,  dimension(:), allocatable :: polyConn      !< Connectivity - size=sum(polySize)
       integer :: nvar=0                                                 !< Number of surface variables stored (default=0)
@@ -25,6 +25,8 @@ module surfmesh_class
       procedure :: set_size                                !< Set surface mesh to provided size
       procedure :: finalize                                !< Finalize surfmesh object
       procedure :: add_polygon                             !< Append a polygon (grows arrays as needed)
+      procedure :: add_variable                            !< Append a named scalar, preserving geometry and values
+      procedure :: variable_index                          !< Return slot, or zero if absent
    end type surfmesh
    
    
@@ -367,15 +369,20 @@ contains
    !> Grows internal arrays as needed using doubling strategy
    !> Optional vardata provides nvar surface variable values for the polygon
    subroutine add_polygon(this, nv, verts, vardata)
+      use messager, only: die
       implicit none
       class(surfmesh), intent(inout) :: this
       integer, intent(in) :: nv                       !< Number of vertices
       real(WP), dimension(3,nv), intent(in) :: verts  !< Polygon vertices (3 x nv)
-      real(WP), dimension(this%nvar), intent(in), optional :: vardata !< Per-polygon surface variables
+      real(WP), dimension(:), intent(in), optional :: vardata !< Exactly nvar per-polygon values
       real(WP), dimension(:), allocatable :: new_x, new_y, new_z
       real(WP), dimension(:,:), allocatable :: new_var
       integer, dimension(:), allocatable :: new_size, new_conn
       integer :: new_cap, i
+
+      if (present(vardata)) then
+         if (size(vardata).ne.this%nvar) call die('[surfmesh add_polygon] vardata must contain nvar values')
+      end if
 
       ! Initialize arrays if not allocated
       if (.not.allocated(this%xVert)) then
@@ -408,16 +415,18 @@ contains
 
       ! Grow polySize and var arrays if needed
       if (this%nPoly + 1 .gt. size(this%polySize)) then
-         new_cap = 2*size(this%polySize)
+         new_cap = max(1,2*size(this%polySize))
          allocate(new_size(new_cap))
          new_size(1:this%nPoly) = this%polySize(1:this%nPoly)
          call move_alloc(new_size, this%polySize)
       end if
-      if (this%nvar .gt. 0 .and. this%nPoly + 1 .gt. size(this%var, 2)) then
-         new_cap = 2*size(this%var, 2)
-         allocate(new_var(this%nvar, new_cap))
-         new_var(:, 1:this%nPoly) = this%var(:, 1:this%nPoly)
-         call move_alloc(new_var, this%var)
+      if (this%nvar.gt.0) then
+         if (this%nPoly + 1 .gt. size(this%var, 2)) then
+            new_cap = max(1,2*size(this%var, 2))
+            allocate(new_var(this%nvar, new_cap))
+            new_var(:, 1:this%nPoly) = this%var(:, 1:this%nPoly)
+            call move_alloc(new_var, this%var)
+         end if
       end if
 
       ! Append polygon
@@ -440,5 +449,51 @@ contains
       end if
 
    end subroutine add_polygon
+
+   !> Find a registered name. Slot numbers survive reset and subsequent additions.
+   integer function variable_index(this,name) result(slot)
+      implicit none
+      class(surfmesh), intent(in) :: this
+      character(len=*), intent(in) :: name
+      integer :: n
+      slot=0
+      do n=1,this%nvar
+         if (this%varname(n).eq.trim(adjustl(name))) then
+            slot=n
+            return
+         end if
+      end do
+   end function variable_index
+
+   !> Register on every rank before the first output. Existing geometry/values are retained.
+   subroutine add_variable(this,name,slot)
+      use messager, only: die
+      implicit none
+      class(surfmesh), intent(inout) :: this
+      character(len=*), intent(in) :: name
+      integer, intent(out), optional :: slot
+      character(len=str_medium), allocatable :: names(:)
+      real(WP), allocatable :: values(:,:)
+      integer :: capacity
+      if (len_trim(name).eq.0.or.len_trim(name).gt.str_medium) call die('[surfmesh add_variable] invalid name length')
+      if (verify(trim(adjustl(name)),'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-').ne.0) &
+         call die('[surfmesh add_variable] use letters, digits, underscore, dot or hyphen in names')
+      if (this%variable_index(name).ne.0) call die('[surfmesh add_variable] duplicate name: '//trim(name))
+      allocate(names(this%nvar+1))
+      if (this%nvar.gt.0) names(1:this%nvar)=this%varname
+      names(this%nvar+1)=trim(adjustl(name))
+      call move_alloc(names,this%varname)
+      capacity=this%nPoly
+      if (allocated(this%var)) capacity=size(this%var,2)
+      if (allocated(this%polySize)) capacity=max(capacity,size(this%polySize))
+      if (allocated(this%var).or.capacity.gt.0) then
+         allocate(values(this%nvar+1,capacity)); values=0.0_WP
+         if (this%nvar.gt.0.and.this%nPoly.gt.0) values(1:this%nvar,1:this%nPoly)=this%var(:,1:this%nPoly)
+         call move_alloc(values,this%var)
+      end if
+      this%nvar=this%nvar+1
+      if (present(slot)) slot=this%nvar
+   end subroutine add_variable
+
 
 end module surfmesh_class

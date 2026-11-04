@@ -27,6 +27,12 @@ module amrvof_class
    real(WP), parameter, public :: VFhi=1.0_WP-VFlo   ! Maximum VF value considered
    real(WP), parameter, public :: vol_eps=1.0e-8_WP  ! Volume epsilon for division by zero
 
+   !> Borrowed field objects; FAB pointers are reacquired on each refresh after regrids.
+   type :: surfvar_entry
+      type(amrdata), pointer :: src=>null()
+      integer :: comp=1,slot=0
+   end type surfvar_entry
+
    !> AMRVOF solver type
    type, extends(amrsolver) :: amrvof
 
@@ -41,6 +47,7 @@ module amrvof_class
 
       ! Ghost cell count
       integer :: nover=2
+      integer :: nover_old=-1  !< Ghost cells of the old state (VFold, CLold, CGold, PLICold), <0 uses nover; advance_vof expects nover
 
       ! VF: cell-centered amrdata at all levels
       type(amrdata) :: VF,VFold
@@ -51,6 +58,9 @@ module amrvof_class
 
       ! PLIC: finest-level-only multifab, 4 components (nx, ny, nz, d)
       type(amrex_multifab) :: PLIC,PLICold
+
+      ! Overwrite VF with the PLIC volume in reset_moments (.false.: keep the transported VF, barycenters only)
+      logical :: reset_vf=.true.
 
       ! Curvature
       logical :: calculate_curv=.true.
@@ -67,7 +77,7 @@ module amrvof_class
       real(WP) :: VFmin=0.0_WP
       real(WP) :: VFmax=0.0_WP
       real(WP) :: VFint=0.0_WP
-      
+
       ! Per-rank timing accumulators (reset by get_info)
       real(WP) :: wt_advance=0.0_WP    !< Full advance_vof
       real(WP) :: wt_sl=0.0_WP         !< SL flux+update
@@ -82,9 +92,13 @@ module amrvof_class
       real(WP) :: wtmax_polygon=0.0_WP, wtmin_polygon=0.0_WP
       ! Load distribution diagnostics
       integer :: nmixed_max=0, nmixed_min=0
-      
+
       ! Surface mesh for visualization
       type(surfmesh) :: smesh
+      type(surfvar_entry), allocatable, private :: surfvars(:)
+      integer, allocatable, private :: surf_first(:),surf_count(:) !< Indexed by grid_index()+1
+      integer, allocatable, private :: surf_cell(:,:) !< Owner (i,j,k) by polygon; AMR metadata, not mesh storage
+      integer, private :: surf_lvl=-1
 
       ! Flag to skip registration with amrgrid in case of inheritance
       logical :: skip_registration=.false.
@@ -109,6 +123,9 @@ module amrvof_class
       procedure :: build_plic             !< Reconstruct PLIC from VF and barycenters
       procedure :: build_plicnet          !< PLICnet reconstruction
       procedure :: build_polygons         !< Build polygons from PLIC planes
+      procedure :: add_surfvar            !< Register a cell-centered amrdata component for PLIC output
+      procedure :: update_surfvars        !< Sample current sources onto existing polygons before output
+      procedure, private :: clear_surfmesh
       procedure :: reset_moments          !< Recompute VF/barycenters from PLIC
       procedure :: build_band             !< Build transport band around interface
       procedure :: build_subVF            !< Build sub-cell volume fractions
@@ -271,9 +288,12 @@ contains
       end if
       ! Store amrgrid pointer
       this%amr=>amr
+      ! Old state ghost cell count defaults to nover, and cannot exceed it since the old state is copied from the current one
+      if (this%nover_old.lt.0) this%nover_old=this%nover
+      this%nover_old=min(this%nover_old,this%nover)
       ! Initialize VF/VFold as amrdata (all levels, used for tagging + average-down)
-      call this%VF%initialize   (amr,name='VF'   ,ncomp=1,ng=this%nover,interp=interp_const); this%VF%parent   =>this
-      call this%VFold%initialize(amr,name='VFold',ncomp=1,ng=this%nover,interp=interp_const); this%VFold%parent=>this
+      call this%VF%initialize   (amr,name='VF'   ,ncomp=1,ng=this%nover    ,interp=interp_const); this%VF%parent   =>this
+      call this%VFold%initialize(amr,name='VFold',ncomp=1,ng=this%nover_old,interp=interp_const); this%VFold%parent=>this
       ! Initialize surface mesh for visualization
       if (this%calculate_curv) then
          this%smesh=surfmesh(nvar=1,name=trim(this%name)//'_plic')
@@ -317,6 +337,8 @@ contains
       call amrex_multifab_destroy(this%curv)
       call amrex_multifab_destroy(this%SD)
       ! Finalize surface mesh
+      call this%clear_surfmesh()
+      if (allocated(this%surfvars)) deallocate(this%surfvars)
       call this%smesh%finalize()
       ! Nullify pointers
       nullify(this%amr)
@@ -343,12 +365,13 @@ contains
       call this%VFold%reset_level(lvl,ba,dm); call this%VFold%setval(val=0.0_WP,lvl=lvl)
       ! Build finest-level multifabs if we are at the finest level
       if (lvl.eq.this%amr%maxlvl) then
+         call this%clear_surfmesh()
          call mfab_rebuild(this%CL     ,ba,dm,nc=3,ng=this%nover)
          call mfab_rebuild(this%CG     ,ba,dm,nc=3,ng=this%nover)
          call mfab_rebuild(this%PLIC   ,ba,dm,nc=4,ng=this%nover)
-         call mfab_rebuild(this%CLold  ,ba,dm,nc=3,ng=this%nover)
-         call mfab_rebuild(this%CGold  ,ba,dm,nc=3,ng=this%nover)
-         call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover)
+         call mfab_rebuild(this%CLold  ,ba,dm,nc=3,ng=this%nover_old)
+         call mfab_rebuild(this%CGold  ,ba,dm,nc=3,ng=this%nover_old)
+         call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover_old)
          if (this%calculate_curv) then
             call mfab_rebuild(this%curv,ba,dm,nc=1,ng=this%nover)
             call mfab_rebuild(this%SD  ,ba,dm,nc=1,ng=this%nover)
@@ -370,13 +393,14 @@ contains
       call this%VFold%reset_level(lvl,ba,dm)
       ! Build finest-level multifabs if we are at the finest level
       if (lvl.eq.this%amr%maxlvl) then
+         call this%clear_surfmesh()
          ! Rebuild and zero out
          call mfab_rebuild(this%CL,     ba,dm,nc=3,ng=this%nover)
          call mfab_rebuild(this%CG,     ba,dm,nc=3,ng=this%nover)
          call mfab_rebuild(this%PLIC,   ba,dm,nc=4,ng=this%nover)
-         call mfab_rebuild(this%CLold,  ba,dm,nc=3,ng=this%nover)
-         call mfab_rebuild(this%CGold,  ba,dm,nc=3,ng=this%nover)
-         call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover)
+         call mfab_rebuild(this%CLold,  ba,dm,nc=3,ng=this%nover_old)
+         call mfab_rebuild(this%CGold,  ba,dm,nc=3,ng=this%nover_old)
+         call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover_old)
          if (this%calculate_curv) then
             call mfab_rebuild(this%curv,ba,dm,nc=1,ng=this%nover)
             call mfab_rebuild(this%SD  ,ba,dm,nc=1,ng=this%nover)
@@ -424,6 +448,7 @@ contains
       call this%VFold%reset_level(lvl,ba,dm)
       ! Rebuild finest-level multifabs if we are at the finest level
       if (lvl.eq.this%amr%maxlvl) then
+         call this%clear_surfmesh()
          remake_finest: block
             use amrex_amr_module, only: amrex_multifab_build,amrex_multifab_destroy, &
             &                           amrex_mfiter,amrex_mfiter_build,amrex_mfiter_destroy
@@ -473,9 +498,9 @@ contains
                call this%SD  %move(SD_new)
             end if
             ! Rebuild empty old multifabs
-            call mfab_rebuild(this%CLold,  ba,dm,nc=3,ng=this%nover)
-            call mfab_rebuild(this%CGold,  ba,dm,nc=3,ng=this%nover)
-            call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover)
+            call mfab_rebuild(this%CLold,  ba,dm,nc=3,ng=this%nover_old)
+            call mfab_rebuild(this%CGold,  ba,dm,nc=3,ng=this%nover_old)
+            call mfab_rebuild(this%PLICold,ba,dm,nc=4,ng=this%nover_old)
          end block remake_finest
       end if
    end subroutine on_remake
@@ -489,6 +514,7 @@ contains
       call this%VF%clear_level(lvl)
       call this%VFold%clear_level(lvl)
       if (lvl.eq.this%amr%maxlvl) then
+         call this%clear_surfmesh()
          call amrex_multifab_destroy(this%CL)
          call amrex_multifab_destroy(this%CG)
          call amrex_multifab_destroy(this%PLIC)
@@ -611,10 +637,10 @@ contains
       if (this%amr%clvl().lt.this%amr%maxlvl) return
       ! Copy VF to VFold
       call this%VFold%copy(src=this%VF)
-      ! Copy CL, CG, and PLIC
-      call this%CLold%copy  (srcmf=this%CL  ,srccomp=1,dstcomp=1,nc=3,ng=this%nover)
-      call this%CGold%copy  (srcmf=this%CG  ,srccomp=1,dstcomp=1,nc=3,ng=this%nover)
-      call this%PLICold%copy(srcmf=this%PLIC,srccomp=1,dstcomp=1,nc=4,ng=this%nover)
+      ! Copy CL, CG, and PLIC over the old state ghost cells
+      call this%CLold%copy  (srcmf=this%CL  ,srccomp=1,dstcomp=1,nc=3,ng=this%nover_old)
+      call this%CGold%copy  (srcmf=this%CG  ,srccomp=1,dstcomp=1,nc=3,ng=this%nover_old)
+      call this%PLICold%copy(srcmf=this%PLIC,srccomp=1,dstcomp=1,nc=4,ng=this%nover_old)
    end subroutine store_old
 
    !> Unified ghost fill: VF at all levels, CL/CG/PLIC at maxlvl
@@ -999,6 +1025,89 @@ contains
       this%wt_plicnet=this%wt_plicnet+(MPI_Wtime()-t0)
    end subroutine build_plicnet
 
+   !> Drop geometry/provenance together; retain the registered variable schema.
+   subroutine clear_surfmesh(this)
+      implicit none
+      class(amrvof), intent(inout) :: this
+      call this%smesh%reset()
+      if (allocated(this%surf_first)) deallocate(this%surf_first,this%surf_count)
+      if (allocated(this%surf_cell)) deallocate(this%surf_cell)
+      this%surf_lvl=-1
+   end subroutine clear_surfmesh
+
+   !> Call on every rank after source initialization, before the first output.
+   !> src (or its containing solver) must be TARGET and outlive this registration.
+   !> Registration does not sample values and may follow an initial geometry build.
+   subroutine add_surfvar(this,src,comp,name)
+      use messager, only: die
+      implicit none
+      class(amrvof), intent(inout) :: this
+      type(amrdata), target, intent(in) :: src
+      integer, intent(in) :: comp
+      character(len=*), intent(in) :: name
+      type(surfvar_entry), allocatable :: entries(:)
+      integer :: n,slot
+      if (.not.associated(this%amr)) call die('[amrvof add_surfvar] initialize the solver first')
+      if (.not.associated(src%amr,this%amr)) call die('[amrvof add_surfvar] source belongs to a different grid')
+      if (comp.lt.1.or.comp.gt.src%ncomp) call die('[amrvof add_surfvar] invalid source component')
+      if (any(src%nodal)) call die('[amrvof add_surfvar] source must be cell-centered')
+      call this%smesh%add_variable(name,slot)
+      n=0
+      if (allocated(this%surfvars)) n=size(this%surfvars)
+      allocate(entries(n+1))
+      if (n.gt.0) entries(1:n)=this%surfvars
+      entries(n+1)%src=>src
+      entries(n+1)%comp=comp
+      entries(n+1)%slot=slot
+      call move_alloc(entries,this%surfvars)
+   end subroutine add_surfvar
+
+   !> Refresh attributes only: the driver must finish reconstruction and diagnostics first.
+   !> Reads valid owner cells without interpolation, ghost fills, or geometry recomputation.
+   subroutine update_surfvars(this)
+      use amrex_amr_module, only: amrex_mfiter
+      use amrex_interface, only: amrmfab_same_layout
+      use iso_c_binding, only: c_associated
+      use messager, only: die
+      implicit none
+      class(amrvof), intent(inout) :: this
+      type(amrex_mfiter) :: mfi
+      real(WP), contiguous, pointer :: p(:,:,:,:)
+      integer :: n,lvl,g,np,ind(3),slot
+      if (.not.allocated(this%surfvars)) return
+      if (this%amr%clvl().lt.this%amr%maxlvl) return
+      lvl=this%amr%maxlvl
+      if (this%surf_lvl.ne.lvl) call die('[amrvof update_surfvars] rebuild polygons after the grid changed')
+      if (sum(this%surf_count).ne.this%smesh%nPoly) call die('[amrvof update_surfvars] surface geometry was modified externally')
+      ! Validate even on ranks without polygons, before sharing the geometry's MFIter.
+      do n=1,size(this%surfvars)
+         associate(src=>this%surfvars(n)%src)
+            if (.not.associated(src%amr,this%amr)) call die('[amrvof update_surfvars] source belongs to a different grid')
+            if (.not.allocated(src%mf)) call die('[amrvof update_surfvars] source is not initialized')
+            if (lvl.lt.lbound(src%mf,1).or.lvl.gt.ubound(src%mf,1)) call die('[amrvof update_surfvars] source level is unavailable')
+            if (.not.c_associated(src%mf(lvl)%p)) call die('[amrvof update_surfvars] source level is not allocated')
+            if (any(src%nodal)) call die('[amrvof update_surfvars] source must remain cell-centered')
+            if (this%surfvars(n)%comp.gt.src%ncomp) call die('[amrvof update_surfvars] source component is unavailable')
+            if (amrmfab_same_layout(this%PLIC%p,src%mf(lvl)%p).eq.0) &
+               call die('[amrvof update_surfvars] source BoxArray/DistributionMapping differs from PLIC')
+         end associate
+      end do
+      call this%amr%mfiter_build(lvl,mfi,tiling=.false.)
+      do while (mfi%next())
+         g=mfi%grid_index()+1
+         if (this%surf_count(g).eq.0) cycle
+         do n=1,size(this%surfvars)
+            p=>this%surfvars(n)%src%mf(lvl)%dataptr(mfi)
+            slot=this%surfvars(n)%slot
+            do np=this%surf_first(g),this%surf_first(g)+this%surf_count(g)-1
+               ind=this%surf_cell(:,np)
+               this%smesh%var(slot,np)=p(ind(1),ind(2),ind(3),this%surfvars(n)%comp)
+            end do
+         end do
+      end do
+      call this%amr%mfiter_destroy(mfi)
+   end subroutine update_surfvars
+
    !> Build polygons and curvature from PLIC planes
    subroutine build_polygons(this)
       use mpi_f08, only: MPI_Wtime
@@ -1021,15 +1130,23 @@ contains
       integer, dimension(:,:,:), allocatable :: poly_nv_local       ! (ilo:ihi, jlo:jhi, klo:khi)
       real(WP), dimension(3,6) :: poly_verts
       real(WP) :: maxcurv,mycurv,ivol
-      integer :: poly_nv
+      integer :: poly_nv,g
+      integer, allocatable :: new_cell(:,:)
+      type(amrex_boxarray) :: ba
+      real(WP) :: vardata(this%smesh%nvar)
       ! Start timer
       t0=MPI_Wtime()
       ! Reset polygon and curvature storage
-      call this%smesh%reset()
+      call this%clear_surfmesh()
       ! Return if clvl<maxlvl
       if (this%amr%clvl().lt.this%amr%maxlvl) return
       ! Get level and cell size
       lvl=this%amr%maxlvl
+      ba=this%amr%get_boxarray(lvl)
+      allocate(this%surf_first(ba%nboxes()),this%surf_count(ba%nboxes()))
+      allocate(this%surf_cell(3,0))
+      this%surf_first=0; this%surf_count=0
+      this%surf_lvl=lvl
       dx=this%amr%dx(lvl); dy=this%amr%dy(lvl); dz=this%amr%dz(lvl); ivol=1.0_WP/this%amr%cell_vol(lvl)
       maxcurv=1.0_WP/this%amr%min_meshsize(lvl)
       ! Create new curv and SD mfabs
@@ -1038,8 +1155,11 @@ contains
          call this%SD  %setval(0.0_WP)
       end if
       ! Compute new polygons
+      vardata=0.0_WP
       call this%amr%mfiter_build(lvl,mfi,tiling=.false.)
       do while (mfi%next())
+         g=mfi%grid_index()+1
+         this%surf_first(g)=this%smesh%nPoly+1
          ! Get local and grown boxes
          bx=mfi%tilebox()
          gbx=mfi%growntilebox(2)  ! Grown by 2 for 5x5x5 stencil for curvature calculation
@@ -1051,7 +1171,7 @@ contains
          ! ----- Step B: Extract polygons (grown box including ghosts) -----
          do k=gbx%lo(3),gbx%hi(3); do j=gbx%lo(2),gbx%hi(2); do i=gbx%lo(1),gbx%hi(1)
             ! Skip cells with no interface
-            if (abs(pPLIC(i,j,k,4)).gt.1.0e+9_WP) cycle         
+            if (abs(pPLIC(i,j,k,4)).gt.1.0e+9_WP) cycle
             ! Build hex and plane
             lo=[this%amr%xlo+real(i  ,WP)*dx,this%amr%ylo+real(j  ,WP)*dy,this%amr%zlo+real(k  ,WP)*dz]
             hi=[this%amr%xlo+real(i+1,WP)*dx,this%amr%ylo+real(j+1,WP)*dy,this%amr%zlo+real(k+1,WP)*dz]
@@ -1089,14 +1209,18 @@ contains
          do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
             poly_nv=poly_nv_local(i,j,k)
             if (poly_nv.ge.3) then
-               if (this%calculate_curv) then
-                  call this%smesh%add_polygon(nv=poly_nv,verts=polygon_local(:,1:poly_nv,i,j,k),vardata=[pCurv(i,j,k,1)])
-               else
-                  call this%smesh%add_polygon(nv=poly_nv,verts=polygon_local(:,1:poly_nv,i,j,k))
+               if (this%calculate_curv) vardata(1)=pCurv(i,j,k,1)
+               call this%smesh%add_polygon(nv=poly_nv,verts=polygon_local(:,1:poly_nv,i,j,k),vardata=vardata)
+               if (this%smesh%nPoly.gt.size(this%surf_cell,2)) then
+                  allocate(new_cell(3,size(this%smesh%polySize)))
+                  new_cell(:,1:this%smesh%nPoly-1)=this%surf_cell(:,1:this%smesh%nPoly-1)
+                  call move_alloc(new_cell,this%surf_cell)
                end if
+               this%surf_cell(:,this%smesh%nPoly)=[i,j,k]
             end if
          end do; end do; end do
          ! ----- Step E: Deallocate per-FAB storage -----
+         this%surf_count(g)=this%smesh%nPoly-this%surf_first(g)+1
          deallocate(polygon_local,poly_nv_local)
       end do
       call this%amr%mfiter_destroy(mfi)
@@ -1262,7 +1386,7 @@ contains
             ! Cut hex by plane
             call cut_hex_vol(hex,plane,vol_liq,vol_gas,bary_liq,bary_gas)
             ! Update VF and barycenters
-            pVF(i,j,k,1)=vol_liq/cell_vol
+            if (this%reset_vf) pVF(i,j,k,1)=vol_liq/cell_vol
             pCL(i,j,k,1:3)=bary_liq
             pCG(i,j,k,1:3)=bary_gas
          end do; end do; end do
@@ -1457,7 +1581,7 @@ contains
             call die('[advance_vof] velocity requires >= 2 ghost cells')
          end if
       end block check_velocity
-      
+
       ! Build band to localize computation
       call this%amr%mfab_build(lvl=lvl,mfab=band,ncomp=1,nover=1)
       call this%build_band(lvl=lvl,VF=this%VFold%mf(lvl),band=band,nband=2)
@@ -1742,14 +1866,14 @@ contains
 
       ! Clean up band multifab
       call this%amr%mfab_destroy(band)
-      
+
       ! Sync and apply BC
       call this%fill(lvl,time)
 
       ! End full routine timer
       this%wt_advance=this%wt_advance+(MPI_Wtime()-t0)
    contains
-      
+
       !> Recursive function that cuts a tet by grid planes to compute fluxes
       recursive function tet2flux(mytet,myind) result(myflux)
          use amrvof_geometry, only: cut_side,cut_v1,cut_v2,cut_vtet,cut_ntets,cut_nvert
@@ -1766,9 +1890,9 @@ contains
          integer, dimension(3,4) :: newind
          real(WP), dimension(3) :: a,b,c
          real(WP) :: xcut,ycut,zcut
-         
+
          myflux=0.0_WP
-         
+
          ! Determine if tet spans multiple cells and needs cutting
          if (maxval(myind(1,:))-minval(myind(1,:)).gt.0) then
             dir=1; cut_ind=maxval(myind(1,:))
@@ -1787,13 +1911,13 @@ contains
             myflux=tet2flux_plic(mytet,myind(1,1),myind(2,1),myind(3,1))
             return
          end if
-         
+
          ! Find cut case (1-indexed: 1-16)
          icase=1+int(0.5_WP+sign(0.5_WP,dd(1)))&
          &    +2*int(0.5_WP+sign(0.5_WP,dd(2)))&
          &    +4*int(0.5_WP+sign(0.5_WP,dd(3)))&
          &    +8*int(0.5_WP+sign(0.5_WP,dd(4)))
-         
+
          ! Copy vertices and indices
          do n1=1,4
             vert(:,n1)=mytet(:,n1)
@@ -1802,7 +1926,7 @@ contains
             vert_ind(dir,n1,1)=min(vert_ind(dir,n1,1),cut_ind-1)
             vert_ind(dir,n1,2)=max(vert_ind(dir,n1,1),cut_ind)
          end do
-         
+
          ! Create interpolated vertices on cut plane
          do n1=1,cut_nvert(icase)
             v1=cut_v1(n1,icase); v2=cut_v2(n1,icase)
@@ -1817,7 +1941,7 @@ contains
             vert_ind(dir,4+n1,1)=cut_ind-1
             vert_ind(dir,4+n1,2)=cut_ind
          end do
-         
+
          ! Create and process sub-tets
          do n1=1,cut_ntets(icase)
             do n2=1,4
@@ -1833,7 +1957,7 @@ contains
          end do
 
       end function tet2flux
-      
+
       !> Cut tet by PLIC and compute flux (base case of recursion) - uses pPLICold
       function tet2flux_plic(mytet,i0,j0,k0) result(myflux)
          use amrvof_geometry, only: cut_v1,cut_v2,cut_vtet,cut_ntets,cut_nvert,cut_nntet,tet_vol
@@ -1847,7 +1971,7 @@ contains
          real(WP), dimension(3,8) :: vert
          real(WP), dimension(3) :: a,b,c,bary,normal,bary_tot
          real(WP) :: mu,my_vol,dist,VF0,vol_tot
-         
+
          myflux=0.0_WP
 
          ! Check indices are within PLICold bounds
@@ -1876,7 +2000,7 @@ contains
             myflux(6:8)=vol_tot*bary_tot
             return
          end if
-         
+
          ! Get PLIC from this cell
          normal=pPLICold(i0,j0,k0,1:3)
          dist=pPLICold(i0,j0,k0,4)
@@ -1937,7 +2061,7 @@ contains
          end if
          
       end function tet2flux_plic
-      
+
       !> RK2 vertex projection back in time
       function project(p1,mydt) result(p2)
          implicit none
@@ -2080,7 +2204,7 @@ contains
       this%VFmin=this%VF%get_min(lvl=this%amr%maxlvl)
       this%VFmax=this%VF%get_max(lvl=this%amr%maxlvl)
       this%VFint=this%VF%get_sum(lvl=0)*this%amr%cell_vol(0)
-      
+
       ! Load distribution diagnostics at finest level
       load_distribution: block
          use amrex_amr_module, only: amrex_mfiter

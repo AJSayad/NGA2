@@ -21,6 +21,7 @@ module amrmpflow_class
       type(amrdata) :: U,Uold
       type(amrdata) :: V,Vold
       type(amrdata) :: W,Wold
+      integer :: nover_vel=-1  !< Ghost cells of the face velocities (current and old), <0 uses nover
 
       ! Velocity interpolation method
       integer :: interp_vel=interp_face_div
@@ -100,13 +101,14 @@ contains
       ! Initialize amrvof parent without callback registration
       this%amrvof%skip_registration=.true.
       call this%amrvof%initialize(amr,name)
-      ! Initialize staggered velocity
-      call this%U%initialize(amr,name='U',ncomp=1,ng=this%nover,nodal=[.true. ,.false.,.false.])
-      call this%V%initialize(amr,name='V',ncomp=1,ng=this%nover,nodal=[.false.,.true. ,.false.])
-      call this%W%initialize(amr,name='W',ncomp=1,ng=this%nover,nodal=[.false.,.false.,.true. ])
-      call this%Uold%initialize(amr,name='Uold',ncomp=1,ng=this%nover,nodal=[.true. ,.false.,.false.])
-      call this%Vold%initialize(amr,name='Vold',ncomp=1,ng=this%nover,nodal=[.false.,.true. ,.false.])
-      call this%Wold%initialize(amr,name='Wold',ncomp=1,ng=this%nover,nodal=[.false.,.false.,.true. ])
+      ! Initialize staggered velocity (ghost cell count defaults to nover)
+      if (this%nover_vel.lt.0) this%nover_vel=this%nover
+      call this%U%initialize(amr,name='U',ncomp=1,ng=this%nover_vel,nodal=[.true. ,.false.,.false.])
+      call this%V%initialize(amr,name='V',ncomp=1,ng=this%nover_vel,nodal=[.false.,.true. ,.false.])
+      call this%W%initialize(amr,name='W',ncomp=1,ng=this%nover_vel,nodal=[.false.,.false.,.true. ])
+      call this%Uold%initialize(amr,name='Uold',ncomp=1,ng=this%nover_vel,nodal=[.true. ,.false.,.false.])
+      call this%Vold%initialize(amr,name='Vold',ncomp=1,ng=this%nover_vel,nodal=[.false.,.true. ,.false.])
+      call this%Wold%initialize(amr,name='Wold',ncomp=1,ng=this%nover_vel,nodal=[.false.,.false.,.true. ])
       ! Set velocity fillbc callbacks to shared internal handler
       this%U%fillbc=>velocity_fillbc
       this%V%fillbc=>velocity_fillbc
@@ -115,9 +117,9 @@ contains
       call this%div%initialize(amr,name='div',ncomp=1,ng=0)
       ! Initialize Q
       if (this%nQ.gt.0) then
-         ! Initialize conserved variables
-         call this%Q%initialize   (amr,name='Q'   ,ncomp=this%nQ,ng=this%nover,interp=this%interp_Q)
-         call this%Qold%initialize(amr,name='Qold',ncomp=this%nQ,ng=this%nover,interp=this%interp_Q)
+         ! Initialize conserved variables (Qold is part of the old state, see amrvof nover_old)
+         call this%Q%initialize   (amr,name='Q'   ,ncomp=this%nQ,ng=this%nover    ,interp=this%interp_Q)
+         call this%Qold%initialize(amr,name='Qold',ncomp=this%nQ,ng=this%nover_old,interp=this%interp_Q)
          ! Set Q fillbc callback to internal handler
          this%Q%fillbc=>Q_fillbc
          ! Allocate min/max/integral arrays

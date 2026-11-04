@@ -4,7 +4,7 @@ module simulation
    use precision,           only: WP
    use string,              only: str_medium
    use amrgrid_class,       only: amrgrid
-   use amrmpcomp_class,     only: amrmpcomp
+   use amrmpcomp_class, only: amrmpcomp
    use amrviz_class,        only: amrviz
    use amrdata_class,       only: amrdata
    use timetracker_class,   only: timetracker
@@ -13,7 +13,7 @@ module simulation
    use amrio_class,         only: amrio
    use nasg_class,          only: nasg
    use ideal_gas_class,     only: ideal_gas
-   use relax_ig_nasg_class, only: relax_ig_nasg, Prelax
+   use relax_isentropic_class, only: relax_isentropic
    ! use safe_relax_class,    only: safe_relax
    implicit none
    private
@@ -26,7 +26,7 @@ module simulation
    !> Timetracker and compressible multiphase solver
    type(timetracker) :: time
    type(amrmpcomp), target :: fs
-   type(amrdata) :: dQdt,Umag,Mach
+   type(amrdata) :: dQdt,drhoUdt,drhoVdt,drhoWdt,Umag,Mach
 
    !> Visualization
    type(event) :: viz_evt
@@ -52,12 +52,15 @@ module simulation
    real(WP) :: MOI_xx,MOI_yy,MOI_zz,MOI_xy,MOI_xz,MOI_yz              !< Moment of inertia tensor about VF-weighted COM (VF>=0.1)
    real(WP) :: MOI_xx_001,MOI_yy_001,MOI_zz_001,MOI_xy_001,MOI_xz_001,MOI_yz_001 !< Moment of inertia tensor about VF-weighted COM (VF>=0.01)
 
+   !> Mixture total energy, the sum of the phasic total energies
+   real(WP) :: Etot=0.0_WP
+
    !> Materials
    type(nasg),      target :: water
    type(ideal_gas), target :: gas
 
    !> Relaxation model
-   type(relax_ig_nasg), target :: relax_model
+   type(relax_isentropic), target :: relax_model
 
    !> Flow parameters - all dimensional (SI)
    real(WP) :: rhoG1,pG1,u1           !< Pre-shock gas state [kg/m^3,Pa,m/s]
@@ -68,6 +71,19 @@ module simulation
    real(WP) :: visc_l,visc_g          !< Constant dynamic viscosities [Pa.s]
    real(WP) :: sigma                  !< Surface tension coefficient [N/m]
    real(WP) :: T1                     !< Ambient (pre-shock) gas temperature [K]
+   real(WP) :: relax_start            !< Time at which relaxation starts [s]
+
+   !> Wall-clock timers of this rank [s], written to the timing monitor (solver-internal timers are in amrmpcomp)
+   real(WP) :: wt_total=0.0_WP        !< Whole time step
+   real(WP) :: wt_cfl=0.0_WP          !< CFL evaluation and time step adjustment
+   real(WP) :: wt_iter=0.0_WP         !< Sub-iteration loop
+   real(WP) :: wt_post=0.0_WP         !< Viscosities and SGS models after the sub-iterations
+   real(WP) :: wt_out=0.0_WP          !< Visualization and checkpoint output
+   real(WP) :: wt_info=0.0_WP         !< Solver info and monitor writes
+   real(WP) :: wt_metrics=0.0_WP      !< Droplet metrics
+
+   !> Artificial bulk viscosity coefficient and viscous CFL clipping
+   real(WP) :: Cartif,max_visc_cfl
 
 contains
 
@@ -92,7 +108,8 @@ contains
       integer :: lvl,i,j,k
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pVisc,pBeta,pDiffL,pDiffG
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pVisc,pBeta
+      ! real(WP), dimension(:,:,:,:), contiguous, pointer :: pDiffL,pDiffG (not available in the staggered solver)
       real(WP), parameter :: myeps=1.0e-15_WP
       ! Loop over levels
       do lvl=0,amr%clvl()
@@ -103,10 +120,10 @@ contains
             pVF=>fs%VF%mf(lvl)%dataptr(mfi)
             pVisc=>fs%visc%mf(lvl)%dataptr(mfi)
             pBeta=>fs%beta%mf(lvl)%dataptr(mfi)
-            pDiffL=>fs%diffL%mf(lvl)%dataptr(mfi)
-            pDiffG=>fs%diffG%mf(lvl)%dataptr(mfi)
-            ! Get tilebox with overlap
-            bx=mfi%growntilebox(fs%nover)
+            ! pDiffL=>fs%diffL%mf(lvl)%dataptr(mfi)
+            ! pDiffG=>fs%diffG%mf(lvl)%dataptr(mfi)
+            ! Get tilebox grown by the viscosity ghost cells
+            bx=mfi%growntilebox(min(fs%visc%ng,fs%beta%ng))
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                      ! Mixture viscosity from constant phasic values
                      !pVisc(i,j,k,1)=pVF(i,j,k,1)*visc_l+(1.0_WP-pVF(i,j,k,1))*visc_g ! Arithmetic averaging
@@ -114,15 +131,58 @@ contains
                      ! Zero bulk viscosity
                      pBeta(i,j,k,1)=0.0_WP
                      ! Run with no heat transfer
-                     pDiffG(i,j,k,1)=0.0_WP
-                     pDiffL(i,j,k,1)=0.0_WP
+                     ! pDiffG(i,j,k,1)=0.0_WP
+                     ! pDiffL(i,j,k,1)=0.0_WP
                   end do; end do; end do
          end do
          call amr%mfiter_destroy(mfi)
       end do
    end subroutine get_viscosities
 
-   !> Apply inflow BC at low-x (face=1)
+   !> Refresh only LAD after prepare_midpoint; molecular and Vreman shear viscosity
+   !> remain at the accepted start-of-step values to isolate bulk-viscosity timing.
+   subroutine update_midpoint_lad()
+      use amrex_amr_module, only: amrex_mfiter,amrex_box
+      implicit none
+      integer :: lvl,i,j,k
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pPL,pPG,pC
+      real(WP) :: cL,cG,mL,mG
+
+      ! prepare_midpoint updates the phasic densities and pressures, but not C.
+      ! Use those midpoint primitives for the LAD sound-speed floor. Use the latest
+      ! iterate's VF, matching add_viscartif's density conversion; do not modify VF
+      ! or the start-of-step geometry used by the subsequent geometric flux sweep.
+      do lvl=0,amr%clvl()
+         call amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pVF=>fs%VF%mf(lvl)%dataptr(mfi)
+            pRHOL=>fs%RHOL%mf(lvl)%dataptr(mfi)
+            pRHOG=>fs%RHOG%mf(lvl)%dataptr(mfi)
+            pPL=>fs%PL%mf(lvl)%dataptr(mfi)
+            pPG=>fs%PG%mf(lvl)%dataptr(mfi)
+            pC=>fs%C%mf(lvl)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               cL=0.0_WP; cG=0.0_WP
+               if (pRHOL(i,j,k,1).gt.0.0_WP) cL=fs%liq%get_c_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP])
+               if (pRHOG(i,j,k,1).gt.0.0_WP) cG=fs%gas%get_c_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP])
+               mL=pVF(i,j,k,1)*pRHOL(i,j,k,1)
+               mG=(1.0_WP-pVF(i,j,k,1))*pRHOG(i,j,k,1)
+               pC(i,j,k,1)=sqrt((mL*cL**2+mG*cG**2)/max(mL+mG,fs%rho_floor))
+            end do; end do; end do
+         end do
+         call amr%mfiter_destroy(mfi)
+      end do
+
+      ! add_viscartif accumulates: clear beta, including ghosts, on every iterate.
+      ! Cvisc=0 leaves the existing molecular+Vreman shear viscosity unchanged.
+      call fs%beta%setval(val=0.0_WP)
+      call fs%add_viscartif(dt=time%dt,Cartif=Cartif,Cvisc=0.0_WP,max_cfl=max_visc_cfl)
+   end subroutine update_midpoint_lad
+
+   !> Apply inflow BC at low-x (face=1). Boundary momentum is not set here: apply_momentum_bc derives it from Q and U
    subroutine shock_dirichlet(solver,lvl,time,face,bx,comp,p)
       use amrex_amr_module, only: amrex_box
       class(amrmpcomp), intent(inout) :: solver
@@ -144,15 +204,12 @@ contains
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                      p(i,j,k,1)=0.0_WP
                   end do; end do; end do
-          case ('Q')  ! Cell-centered Q=(rho2,rho2*u2,0,0,rho2*I2)
+          case ('Q')  ! Cell-centered Q=(0,rho2,0,E2); momentum is staggered and not part of Q
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                      p(i,j,k,1)=0.0_WP                  ! No liquid
                      p(i,j,k,2)=rhoG2                   ! Gas density
                      p(i,j,k,3)=0.0_WP                  ! No liquid energy
-                     p(i,j,k,4)=rhoG2*gas%get_e_from_p_rho(p=pG2,rho=rhoG2,y=[1.0_WP]) ! Gas internal energy
-                     p(i,j,k,5)=rhoG2*u2                ! X-momentum
-                     p(i,j,k,6)=0.0_WP
-                     p(i,j,k,7)=0.0_WP
+                     p(i,j,k,4)=rhoG2*gas%get_e_from_p_rho(p=pG2,rho=rhoG2,y=[1.0_WP])+0.5_WP*rhoG2*u2**2 ! Gas total energy (uniform u2)
                   end do; end do; end do
          end select
       end select
@@ -174,7 +231,8 @@ contains
       type(amrex_box) :: bx
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pCL,pCG
       real(WP), dimension(3) :: BL,BG
-      real(WP) :: dx,dy,dz,myVF,IEL,x_cc,rhoG,pG,uG,H
+      real(WP) :: dx,dy,dz,myVF,IEL,x_cc,rhoG,pG,H
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pU
       integer :: i,j,k
       integer, parameter :: nref=3
       ! Get mesh size
@@ -210,15 +268,23 @@ contains
                   H=Hshock(x=Xs-x_cc,delta=0.5_WP*dx)
                   rhoG=rhoG1+(rhoG2-rhoG1)*H
                   pG  =pG1  +(pG2  -pG1  )*H
-                  uG  =u1   +(u2   -u1   )*H
-                  ! Set conserved variables: Q=(VF*rhoL, (1-VF)*rhoG, VF*rhoL*IL, (1-VF)*rhoG*IG, rho_mix*U, 0, 0)
+                  ! Set conserved variables: Q=(VF*rhoL, (1-VF)*rhoG, VF*rhoL*IL, (1-VF)*rhoG*IG); momentum is staggered
                   pQ(i,j,k,1)=(       myVF)*rhoL1
                   pQ(i,j,k,2)=(1.0_WP-myVF)*rhoG
                   pQ(i,j,k,3)=pQ(i,j,k,1)*IEL
                   pQ(i,j,k,4)=pQ(i,j,k,2)*gas%get_e_from_p_rho(p=pG,rho=rhoG,y=[1.0_WP])
-                  pQ(i,j,k,5)=(pQ(i,j,k,1)+pQ(i,j,k,2))*uG
-                  pQ(i,j,k,6)=0.0_WP
-                  pQ(i,j,k,7)=0.0_WP
+               end do; end do; end do
+      end do
+      call amrex_mfiter_destroy(mfi)
+      ! Set x-face velocity from the same shock profile, ghosts included. V and W are zero (set by on_init).
+      ! Face momentum is built from this velocity and Q in post_regrid.
+      call amrex_mfiter_build(mfi,ba,dm,tiling=.false.)
+      do while (mfi%next())
+         pU=>solver%U%mf(lvl)%dataptr(mfi)
+         do k=lbound(pU,3),ubound(pU,3); do j=lbound(pU,2),ubound(pU,2); do i=lbound(pU,1),ubound(pU,1)
+                  x_cc=solver%amr%xlo+real(i,WP)*dx
+                  H=Hshock(x=Xs-x_cc,delta=0.5_WP*dx)
+                  pU(i,j,k,1)=u1+(u2-u1)*H
                end do; end do; end do
       end do
       call amrex_mfiter_destroy(mfi)
@@ -228,34 +294,6 @@ contains
    subroutine simulation_init
       use param, only: param_read
       implicit none
-
-      ! Initialize the grid - single static level, no refinement
-      create_amrgrid: block
-         real(WP) :: Lx,Ly
-         ! Set name
-         amr%name='amr_sembian_simplified'
-         ! Static uniform grid: level 0 only
-         amr%maxlvl=0
-         ! Read in grid size
-         call param_read('Base nx',amr%nx)
-         call param_read('Base ny',amr%ny)
-         call param_read('Base nz',amr%nz)
-         ! Set domain: x in [0,Lx], y in [-Ly/2,+Ly/2]
-         call param_read('Lx',Lx)
-         call param_read('Ly',Ly)
-         amr%xlo=0.0_WP;        amr%xhi=+Lx
-         amr%ylo=-0.5_WP*Ly;    amr%yhi=+0.5_WP*Ly
-         amr%zlo=-0.5_WP*Ly;    amr%zhi=+0.5_WP*Ly
-         ! Set periodicity: x and y are physical (constant extrapolation), z is the quasi-2D direction
-         amr%xper=.false.; amr%yper=.false.; amr%zper=.true.
-         ! Enable quasi-2D: one cell deep, dz=dy
-         if (amr%nz.eq.1) then
-            amr%zlo=-0.5_WP*(amr%yhi-amr%ylo)/real(amr%ny,WP)
-            amr%zhi=+0.5_WP*(amr%yhi-amr%ylo)/real(amr%ny,WP)
-         end if
-         ! Initialize
-         call amr%initialize()
-      end block create_amrgrid
 
       ! Read EoS and flow parameters - everything below is dimensional (SI)
       init_eos_and_flow: block
@@ -312,11 +350,43 @@ contains
          call water%print(); call gas%print()
          write(message,'("[Visc]   muL=",es12.5," muG=",es12.5," Pa.s")') visc_l,visc_g; call log(message)
          write(message,'("[Surface tension] sigma=",es12.5," N/m")') sigma; call log(message)
-         write(message,'("[Drop]   d0=",es12.5," m  x0=",es12.5," m  CPD=",es12.5)') d_drop,x_drop,d_drop/amr%dy(0); call log(message)
          if (sigma.gt.0.0_WP) then
             write(message,'("[Scales] We=",es12.5)') rhoG2*u2**2*d_drop/sigma; call log(message)
          end if
       end block init_eos_and_flow
+
+      ! Initialize the grid - single static level, no refinement
+      create_amrgrid: block
+         use messager, only: log
+         use string,   only: str_long
+         character(len=str_long) :: message
+         real(WP) :: Lx,Ly
+         ! Set name
+         amr%name='amr_sembian_simplified'
+         ! Static uniform grid: level 0 only
+         amr%maxlvl=0
+         ! Read in grid size
+         call param_read('Base nx',amr%nx)
+         call param_read('Base ny',amr%ny)
+         call param_read('Base nz',amr%nz)
+         ! Set domain: x in [0,Lx], y in [-Ly/2,+Ly/2]
+         call param_read('Lx',Lx)
+         call param_read('Ly',Ly)
+         amr%xlo=0.0_WP;        amr%xhi=+Lx
+         amr%ylo=-0.5_WP*Ly;    amr%yhi=+0.5_WP*Ly
+         amr%zlo=-0.5_WP*Ly;    amr%zhi=+0.5_WP*Ly
+         ! Set periodicity: x and y are physical (constant extrapolation), z is the quasi-2D direction
+         amr%xper=.false.; amr%yper=.false.; amr%zper=.true.
+         ! Enable quasi-2D: one cell deep, dz=dy
+         if (amr%nz.eq.1) then
+            amr%zlo=-0.5_WP*(amr%yhi-amr%ylo)/real(amr%ny,WP)
+            amr%zhi=+0.5_WP*(amr%yhi-amr%ylo)/real(amr%ny,WP)
+         end if
+         ! Initialize
+         call amr%initialize()
+         ! Log drop resolution (needs the initialized grid)
+         write(message,'("[Drop]   d0=",es12.5," m  x0=",es12.5," m  CPD=",es12.5)') d_drop,x_drop,d_drop/amr%dy(0); call log(message)
+      end block create_amrgrid
 
       ! Handle restart/saves here
       handle_restart: block
@@ -332,10 +402,15 @@ contains
 
       ! Initialize time tracker
       initialize_timetracker: block
+         use messager, only: die
          time=timetracker(amRoot=amr%amRoot)
          call param_read('Max time',time%tmax)
          call param_read('Max dt',time%dtmax)
          call param_read('Max CFL',time%cflmax)
+         ! Iterative midpoint sub-iterations: 2 is explicit midpoint RK2, unstable on the imaginary axis;
+         ! 3 or more is stable for |lambda*dt|<=2
+         call param_read('Subiterations',time%itmax,default=2)
+         if (time%itmax.lt.1) call die('Require at least one sub-iteration')
          call param_read('Max wall time',time%wtmax,default=huge(1.0_WP))
          time%dt=time%dtmax
          if (restarted) then
@@ -347,61 +422,27 @@ contains
       ! Initialize compressible multiphase solver
       create_solver: block
          use amrex_amr_module, only: amrex_bc_ext_dir,amrex_bc_foextrap
-         use amrmpcomp_class,  only: BC_GAS
-         use amrdata_class,    only: interp_face_lin
-         ! Assign materials and create flow solver
-         fs%liq=>water; fs%gas=>gas; call fs%initialize(amr=amr,name='drop')
-         ! Set surface tension coefficient
+         use amrmpcomp_class, only: BC_GAS
+         ! Surface tension coefficient
          fs%sigma=sigma
-         ! Use face-linear interp if 2D (divfree requires ratio=2 in all dirs)
-         if (amr%nz.eq.1) fs%interp_vel=interp_face_lin
-         ! Provide pressure relaxation model
+         ! Band momentum flux: CTU below the staggered phase fraction CTU alpha, MC elsewhere. Set before initialize, which validates them
+         call param_read('CTU alpha',fs%alpha_ctu,default=0.5_WP)
+         ! Relaxation is applied from t=0 unless a later start time is requested
+         call param_read('Relaxation start time',relax_start,default=0.0_WP)
+         ! Assign materials and create flow solver (initialize forces face-linear velocity interpolation)
+         fs%liq=>water; fs%gas=>gas; call fs%initialize(amr=amr,name='drop')
+         ! Provide pressure relaxation model (gas-isentropic)
          call relax_model%initialize(gas=gas,liq=water); fs%relax=>relax_model
-         ! relax_model%model=PThybrid
-         relax_model%model=Prelax
-         ! Ledger units: apply() only runs on the finest (here: only) level
-         ! relax_model%vol=amr%cell_vol(0)
-         ! --- Scale-free knobs (pure ratios, no dimensional adjustment needed) ---
-         ! Never skip the quadratic on low gas density: the unconditional energy swap in
-         ! safe_relax completes the equilibration anyway, so skipping only loses the VF update
-         relax_model%RHOGmin=0.0_WP
-         ! One-sided deficit factor for small-cell agglomeration (dimensionless ratio)
-         fs%merge_sick=100.0_WP
-         ! --- Dimensional safety limits (SI) ---
-         ! Max sustainable tension: the stiffened-gas hard limit is p=-pinf (c->0), so hold
-         ! 2% off it. -3.36e8 Pa - deep, since there is no cavitation/phase-change model here
-         fs%Pmin_liq=-0.98_WP*water%pinf
-         ! Near-vacuum gas floor, O(water saturation pressure at ambient T): 1.01e3 Pa
-         fs%Pmin_gas=1.0e-2_WP*pG1
-         ! Temperature floors at 10% of each phase's OWN ambient temperature. The liquid one
-         ! must NOT be referenced to T1: with gamma_l=6.12 and Pinf=3.43e8 the stiffened-gas
-         ! temperature scale is set by CvL, and T_L(ambient)=(pL1+Pinf)/((gamma_l-1)*rhoL1*CvL)
-         ! ranges from 300 K at the forced-equilibrium CvL=222.9 down to 16 K at the physical
-         ! CvL=4184. A floor pinned to the gas ambient (30 K) sits ABOVE the liquid's own
-         ! ambient in the latter case, so clean_Q and the safe_relax floor would fire in every
-         ! liquid cell from t=0 and pressurise the drop to ~3e8 Pa to reach it.
-         fs%Tmin_liq=0.1_WP*water%get_T_from_p_rho(p=pL1,rho=rhoL1,y=[1.0_WP])
-         fs%Tmin_gas=0.1_WP*T1
-         ! The relaxation floor and the clean_Q rescue use the same limits - set together
-         ! relax_model%Pmin_liq=fs%Pmin_liq; relax_model%Tmin_liq=fs%Tmin_liq
-         ! relax_model%Pmin_gas=fs%Pmin_gas; relax_model%Tmin_gas=fs%Tmin_gas
-         ! Log the limits so they can be sanity-checked against the run
-         ! log_limits: block
-         !    use messager, only: log
-         !    use string,   only: str_long
-         !    character(len=str_long) :: message
-         !    write(message,'("[Relax] PminL=",es12.5," PminG=",es12.5," TminL=",es12.5," TminG=",es12.5," dissP=",es12.5)') &
-         !    &   fs%Pmin_liq,fs%Pmin_gas,fs%Tmin_liq,fs%Tmin_gas,relax_model%diss_P; call log(message)
-         ! end block log_limits
          ! Set initial conditions
          fs%user_init=>shockdrop_init
-         ! Set BCs, following amrcomp_drop: x-low is a Dirichlet post-shock inflow via
-         ! shock_dirichlet, everything else is constant extrapolation. amrcomp_drop is
-         ! periodic in y and z so it only ever sets x; y here is non-periodic and takes
-         ! the same foextrap treatment amrcomp_drop gives x-high. z stays periodic
-         ! (quasi-2D). VOF: BC_GAS at the inflow, defaults elsewhere, as in amrcomp_drop.
+         ! Set BCs. Staggered solver conventions:
+         !  - ext_dir on a velocity component calls shock_dirichlet (normal: boundary face + ghosts; tangential: ghosts)
+         !  - ext_dir on Q calls shock_dirichlet to fill the ghosts; boundary face momentum is then derived by apply_momentum_bc
+         !  - foextrap on a normal velocity leaves the boundary face as an evolved unknown; ghosts copy it
+         ! x-low: post-shock inflow. x-high and y: constant extrapolation (outflow). z stays periodic (quasi-2D).
+         ! VOF: gas ghosts at the inflow; at the outflows the ghosts are also gas so that liquid leaves the domain freely
          if (.not.amr%xper) then
-            fs%lo_bc(1)=BC_GAS
+            fs%lo_bc(1)=BC_GAS; fs%hi_bc(1)=BC_GAS
             fs%Q%lo_bc(1,:)=amrex_bc_ext_dir; fs%Q%hi_bc(1,:)=amrex_bc_foextrap
             fs%U%lo_bc(1,:)=amrex_bc_ext_dir; fs%U%hi_bc(1,:)=amrex_bc_foextrap
             fs%V%lo_bc(1,:)=amrex_bc_ext_dir; fs%V%hi_bc(1,:)=amrex_bc_foextrap
@@ -409,6 +450,7 @@ contains
             fs%user_bc=>shock_dirichlet
          end if
          if (.not.amr%yper) then
+            fs%lo_bc(2)=BC_GAS; fs%hi_bc(2)=BC_GAS
             fs%Q%lo_bc(2,:)=amrex_bc_foextrap; fs%Q%hi_bc(2,:)=amrex_bc_foextrap
             fs%U%lo_bc(2,:)=amrex_bc_foextrap; fs%U%hi_bc(2,:)=amrex_bc_foextrap
             fs%V%lo_bc(2,:)=amrex_bc_foextrap; fs%V%hi_bc(2,:)=amrex_bc_foextrap
@@ -421,11 +463,17 @@ contains
          use amrdata_class, only: interp_none
          call dQdt%initialize(amr,name='dQdt',ncomp=fs%nQ,ng=0,interp=interp_none); call dQdt%register()
          call Umag%initialize(amr,name='Umag',ncomp=1    ,ng=0,interp=interp_none); call Umag%register()
+         call drhoUdt%initialize(amr,name='drhoUdt',ncomp=1,ng=0,nodal=[.true. ,.false.,.false.],interp=interp_none); call drhoUdt%register()
+         call drhoVdt%initialize(amr,name='drhoVdt',ncomp=1,ng=0,nodal=[.false.,.true. ,.false.],interp=interp_none); call drhoVdt%register()
+         call drhoWdt%initialize(amr,name='drhoWdt',ncomp=1,ng=0,nodal=[.false.,.false.,.true. ],interp=interp_none); call drhoWdt%register()
          call Mach%initialize(amr,name='Mach',ncomp=1    ,ng=0,interp=interp_none); call Mach%register()
       end block create_workspace
 
       ! Build the static grid and the initial state
       init_grid: block
+         ! Artificial bulk viscosity: off by default, there are no shocks
+         call param_read('Artificial viscosity coefficient',Cartif,default=0.0_WP)
+         call param_read('Max viscous CFL',max_visc_cfl,default=0.5_WP)
          if (restarted) then
             ! Restore grid hierarchy from checkpoint
             call amr%init_from_checkpoint(dirname=trim(restart_dir),time=time%t)
@@ -434,23 +482,16 @@ contains
          else
             ! Fresh start
             call amr%init_from_scratch(time=time%t)
+            ! Phasic total energies from the internal contents written by user_init and the initial kinetic energy
+            call fs%get_total_energy(time=time%t)
             ! Build PLIC
             call fs%build_plic(time%t)
-            call fs%build_subVF()
-            ! Initialize primitive variables
-            call fs%get_primitive(Q=fs%Q)
-            ! Initialize face velocities
-            call fs%get_face_velocity(time%dt)
-            call fs%average_down_velocity(); call fs%fill_velocity(time=time%t)
          end if
          ! Compute viscosities
          call get_viscosities()
          ! Add SGS models
-         call fs%add_viscartif(dt=time%dt,Cvisc=0.0_WP)
+         call fs%add_viscartif(dt=time%dt,Cartif=Cartif,max_cfl=max_visc_cfl)
          call fs%add_vreman(dt=time%dt)
-         ! Compute Umag and Mach number
-         call Umag%get_magnitude(srcX=fs%UVW,srcY=fs%UVW,srcZ=fs%UVW,compX=1,compY=2,compZ=3)
-         call Mach%copy(src=Umag); call Mach%divide(src=fs%C)
       end block init_grid
 
       ! Initialize checkpoint save event
@@ -487,13 +528,19 @@ contains
          viz_evt=event(time=time,name='Visualization output')
          call param_read('Output period',viz_evt%tper)
          ! Write initial state
-         if (viz_evt%occurs()) call viz%write(time=time%t)
+         if (viz_evt%occurs()) then
+            ! Cell-centered velocity, Umag, and Mach number are only computed for visualization
+            call fs%get_cell_velocity()
+            call Umag%get_magnitude(srcX=fs%UVW,srcY=fs%UVW,srcZ=fs%UVW,compX=1,compY=2,compZ=3)
+            call Mach%copy(src=Umag); call Mach%divide(src=fs%C)
+            call viz%write(time=time%t)
+         end if
       end block create_viz
 
       ! Create monitors
       create_monitors: block
          ! Get solver info and cfl
-         call fs%get_info()
+         call fs%get_info(); Etot=fs%Qint(3)+fs%Qint(4)
          call fs%get_cfl(dt=time%dt,cfl=time%cfl)
          ! Create simulation monitor
          mfile=monitor(amRoot=amr%amRoot,name='simulation')
@@ -544,12 +591,21 @@ contains
          call consfile%add_column(fs%VFint,'VFint')
          call consfile%add_column(fs%Qint(1),'Liquid Mass')
          call consfile%add_column(fs%Qint(2),'Gas Mass')
-         call consfile%add_column(fs%Qint(3),'Liquid IntEnergy')
-         call consfile%add_column(fs%Qint(4),'Gas IntEnergy')
-         call consfile%add_column(fs%Qint(5),'U Momentum')
-         call consfile%add_column(fs%Qint(6),'V Momentum')
-         call consfile%add_column(fs%Qint(7),'W Momentum')
+         call consfile%add_column(fs%Qint(3),'Liquid TotEnergy')
+         call consfile%add_column(fs%Qint(4),'Gas TotEnergy')
+         call consfile%add_column(Etot,'Total energy')
+         call consfile%add_column(fs%rhoUint,'U Momentum')
+         call consfile%add_column(fs%rhoVint,'V Momentum')
+         call consfile%add_column(fs%rhoWint,'W Momentum')
          call consfile%add_column(fs%rhoKint,'Kinetic energy')
+         call consfile%add_column(fs%nrelax_fail,'Relax failures')
+         call consfile%add_column(fs%nvf_guard,'VF guard cells')
+         call consfile%add_column(fs%nsliver,'Sliver cells')
+         call consfile%add_column(fs%ngate,'Gate cells')
+         call consfile%add_column(fs%gate_mass,'Gate mass')
+         call consfile%add_column(fs%gate_energy,'Gate energy')
+         call consfile%add_column(fs%gate_rhoU,'Gate U momentum')
+         call consfile%add_column(fs%gate_rhoV,'Gate V momentum')
          call consfile%write()
          ! Create grid monitor
          gridfile=monitor(amRoot=amr%amRoot,name='grid')
@@ -567,16 +623,32 @@ contains
          tfile=monitor(amRoot=amr%amRoot,name='timing')
          call tfile%add_column(time%n,'Timestep')
          call tfile%add_column(time%t,'Time')
+         ! Step-level timers of this rank
+         call tfile%add_column(wt_total  ,'step_total')
+         call tfile%add_column(wt_cfl    ,'cfl')
+         call tfile%add_column(wt_iter   ,'iterations')
+         call tfile%add_column(wt_post   ,'visc_post')
+         call tfile%add_column(wt_out    ,'output')
+         call tfile%add_column(wt_info   ,'info')
+         call tfile%add_column(wt_metrics,'drop_metrics')
          ! Full routine times (max across ranks = wall-clock cost)
          call tfile%add_column(fs%wtmax_dQdt,'dQdt_max')
          call tfile%add_column(fs%wtmax_plic,'plic_max')
          call tfile%add_column(fs%wtmax_relax,'relax_max')
          call tfile%add_column(fs%wtmax_visc,'visc_max')
+         call tfile%add_column(fs%wtmax_mid,'midpoint_max')
          ! Compute loop times (max = slowest rank, min = fastest rank)
          call tfile%add_column(fs%wtmax_prim,'prim_max')
          call tfile%add_column(fs%wtmin_prim,'prim_min')
-         call tfile%add_column(fs%wtmax_sl,'sl_max')
-         call tfile%add_column(fs%wtmin_sl,'sl_min')
+         call tfile%add_column(fs%wtmax_fvel,'fvel_max')
+         call tfile%add_column(fs%wtmin_fvel,'fvel_min')
+         ! get_dQdt breakdown
+         call tfile%add_column(fs%wtmax_alloc,'alloc_max')
+         call tfile%add_column(fs%wtmin_alloc,'alloc_min')
+         call tfile%add_column(fs%wtmax_slflux,'slflux_max')
+         call tfile%add_column(fs%wtmin_slflux,'slflux_min')
+         call tfile%add_column(fs%wtmax_vmom,'vmom_max')
+         call tfile%add_column(fs%wtmin_vmom,'vmom_min')
          call tfile%add_column(fs%wtmax_fv,'fv_max')
          call tfile%add_column(fs%wtmin_fv,'fv_min')
          call tfile%add_column(fs%wtmax_div,'div_max')
@@ -592,12 +664,12 @@ contains
          rescfile=monitor(amRoot=amr%amRoot,name='rescue')
          call rescfile%add_column(time%n,'Timestep')
          call rescfile%add_column(time%t,'Time')
-         call rescfile%add_column(fs%resc_nl,'LiqResc n')
-         call rescfile%add_column(fs%resc_ml,'LiqResc dm')
-         call rescfile%add_column(fs%resc_el,'LiqResc dE')
-         call rescfile%add_column(fs%resc_ng,'GasResc n')
-         call rescfile%add_column(fs%resc_mg,'GasResc dm')
-         call rescfile%add_column(fs%resc_eg,'GasResc dE')
+         ! call rescfile%add_column(fs%resc_nl,'LiqResc n')
+         ! call rescfile%add_column(fs%resc_ml,'LiqResc dm')
+         ! call rescfile%add_column(fs%resc_el,'LiqResc dE')
+         ! call rescfile%add_column(fs%resc_ng,'GasResc n')
+         ! call rescfile%add_column(fs%resc_mg,'GasResc dm')
+         ! call rescfile%add_column(fs%resc_eg,'GasResc dE')
          ! call rescfile%add_column(diss_n,'Diss n')
          ! call rescfile%add_column(diss_m,'Diss dm')
          ! call rescfile%add_column(quad_n,'Quad n')
@@ -635,60 +707,78 @@ contains
 
    !> Perform an NGA2 simulation
    subroutine simulation_run
+      use mpi_f08, only: MPI_Wtime
       implicit none
+      real(WP) :: tw0,tw1
 
       ! Perform time integration
       do while (.not.time%done())
 
          ! Increment time
+         tw0=MPI_Wtime(); tw1=tw0
          call fs%get_cfl(dt=time%dt,cfl=time%cfl)
          call time%adjust_dt()
          call time%increment()
+         wt_cfl=MPI_Wtime()-tw1; tw1=MPI_Wtime()
 
          ! Remember old state
          call fs%store_old()
 
-         ! ======================= RK2 Stage 1: Q*=Q[n]+dt/2*dQdt(t,Q[n]) =======================
-         ! Increment Q without pressure gradient
-         call fs%get_dQdt(dQdt=dQdt,dt=0.5_WP*time%dt,time=time%tmid)
-         call fs%Q%lincomb(a=1.0_WP,src1=fs%Qold,b=0.5_WP*time%dt,src2=dQdt)
-         call fs%Q%average_down(); call fs%Q%fill(time=time%tmid)
-         ! Rebuild PLIC
-         call fs%build_plic(time=time%t)
-         ! Add surface tension term
-         ! call fs%add_surface_tension(scale=0.5_WP*time%dt)
-         ! Get most up-to-date pressure
-         call fs%apply_relax(dt=0.5_WP*time%dt,time=time%tmid)
-         ! Get primitive variables
-         call fs%get_primitive(Q=fs%Q)
-         ! ======================= RK2 Stage 2: Q[n+1]=Q[n]+dt*dQdt(t,Q*) =======================
-         ! Increment Q without pressure gradient
-         call fs%get_dQdt(dQdt=dQdt,dt=time%dt,time=time%t)
-         call fs%Q%lincomb(a=1.0_WP,src1=fs%Qold,b=time%dt,src2=dQdt)
-         call fs%Q%average_down(); call fs%Q%fill(time=time%t)
-         ! Rebuild PLIC
-         call fs%build_plic(time=time%t)
-         ! Add surface tension term
-         ! call fs%add_surface_tension(scale=time%dt)
-         ! Get most up-to-date pressure
-         call fs%apply_relax(dt=time%dt,time=time%t)
-         ! Get primitive variables
-         call fs%get_primitive(Q=fs%Q)
-         ! ======================================================================================
+         ! ======================= Iterative midpoint sub-iterations =======================
+         do while (time%it.le.time%itmax)
 
-         ! Compute viscosities
+            ! Midpoint state
+            call fs%prepare_midpoint()
+            call update_midpoint_lad()
+
+            ! Surface tension pressure jump at the midpoint
+            call fs%add_surface_tension_jump()
+
+            ! RHS at the midpoint: semi-Lagrangian band transport from the old state and bulk fluxes
+            call fs%get_dQdt(dQdt=dQdt,drhoUdt=drhoUdt,drhoVdt=drhoVdt,drhoWdt=drhoWdt,dt=time%dt,time=time%t)
+
+            ! Update conserved variables from the old state
+            call fs%Q%lincomb   (a=1.0_WP,src1=fs%Qold   ,b=time%dt,src2=dQdt)
+            call fs%rhoU%lincomb(a=1.0_WP,src1=fs%rhoUold,b=time%dt,src2=drhoUdt)
+            call fs%rhoV%lincomb(a=1.0_WP,src1=fs%rhoVold,b=time%dt,src2=drhoVdt)
+            call fs%rhoW%lincomb(a=1.0_WP,src1=fs%rhoWold,b=time%dt,src2=drhoWdt)
+            call fs%Q%average_down(); call fs%Q%fill(time=time%t)
+
+            ! Phasic total energies of the new iterate: transported internal energy, phasic work, and kinetic energy
+            call fs%get_energy(dt=time%dt,time=time%t)
+
+            ! Rebuild PLIC of the new iterate (the band sweep only uses the old PLIC)
+            call fs%build_plic(time=time%t)
+
+            ! Get most up-to-date pressure: the last sub-iteration's relaxation is the end-of-step one
+            if (time%t.ge.relax_start) call fs%apply_relax(dt=time%dt,time=time%t)
+
+            ! Get primitive variables of the new iterate
+            call fs%get_primitive(Q=fs%Q,rhoU=fs%rhoU,rhoV=fs%rhoV,rhoW=fs%rhoW,time=time%t)
+
+            ! Increment sub-iteration counter
+            time%it=time%it+1
+
+         end do
+         ! =================================================================================
+         wt_iter=MPI_Wtime()-tw1; tw1=MPI_Wtime()
+
+         ! Refresh accepted-state coefficients for the next CFL check and output.
          call get_viscosities()
 
          ! Add SGS models
-         call fs%add_viscartif(dt=time%dt,Cvisc=0.0_WP)
+         call fs%add_viscartif(dt=time%dt,Cartif=Cartif,max_cfl=max_visc_cfl)
          call fs%add_vreman(dt=time%dt)
 
-         ! Compute Umag and Mach number
-         call Umag%get_magnitude(srcX=fs%UVW,srcY=fs%UVW,srcZ=fs%UVW,compX=1,compY=2,compZ=3)
-         call Mach%copy(src=Umag); call Mach%divide(src=fs%C)
+         wt_post=MPI_Wtime()-tw1; tw1=MPI_Wtime()
 
-         ! Visualization output
-         if (viz_evt%occurs()) call viz%write(time=time%t)
+         ! Visualization output: cell-centered velocity, Umag, and Mach number are only computed when written
+         if (viz_evt%occurs()) then
+            call fs%get_cell_velocity()
+            call Umag%get_magnitude(srcX=fs%UVW,srcY=fs%UVW,srcZ=fs%UVW,compX=1,compY=2,compZ=3)
+            call Mach%copy(src=Umag); call Mach%divide(src=fs%C)
+            call viz%write(time=time%t)
+         end if
 
          ! Checkpoint save
          if (save_evt%occurs()) then
@@ -698,8 +788,10 @@ contains
             end block save_checkpoint
          end if
 
+         wt_out=MPI_Wtime()-tw1; tw1=MPI_Wtime()
+
          ! Perform and output monitoring
-         call fs%get_info()
+         call fs%get_info(); Etot=fs%Qint(3)+fs%Qint(4)
          ! relax_census: block
          !    use mpi_f08,  only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_SUM
          !    use parallel, only: MPI_REAL_WP
@@ -713,12 +805,17 @@ contains
          call mfile%write()
          call consfile%write()
          call cflfile%write()
-         call tfile%write()
          call rescfile%write()
+         wt_info=MPI_Wtime()-tw1; tw1=MPI_Wtime()
 
          ! Compute droplet metrics on a safe temporary copy of VF
          call compute_drop_metrics()
          call drop_QOIs%write()
+         wt_metrics=MPI_Wtime()-tw1
+         wt_total=MPI_Wtime()-tw0
+
+         ! Timing monitor is written last so that it covers the whole step
+         call tfile%write()
 
       end do
 
@@ -892,6 +989,9 @@ contains
       ! Finalize solver
       call fs%finalize()
       call dQdt%finalize()
+      call drhoUdt%finalize()
+      call drhoVdt%finalize()
+      call drhoWdt%finalize()
       call Umag%finalize()
       call Mach%finalize()
       ! Finalize materials

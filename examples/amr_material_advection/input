@@ -1,0 +1,47 @@
+# AMR grid (1D: 200 cells in x, 1 cell in y and z)
+Base nx:   200
+Base ny:   1
+Base nz:   1
+Max level: 0
+
+# Gammas and EOS
+GammaG: 1.4
+GammaL: 6.12
+PinfL:  3.43e8
+PinfG: 0.0
+
+# Specific heats [J/(kg·K)]
+CvG: 718.0
+CvL: 4184.0
+
+# Gas state (outside the liquid slab)
+Gas density:   1.204
+
+# Liquid state (inside the liquid slab)
+Liquid density:  1000.0
+
+# Uniform initial pressure [Pa] and velocity [m/s]
+Pressure: 101325.0
+Velocity: 100.0
+
+# Liquid slab bounds
+Liquid left:  0.25
+Liquid right: 0.75
+
+# Time integration
+Max dt:   1.25e-6
+Max CFL:  0.8
+Max time: 1.25e-4
+Subiterations: 3
+
+# CTU threshold
+CTU alpha: 0.5
+
+# No shocks: no artificial bulk viscosity
+Artificial viscosity coefficient: 0.0
+
+# Pressure relaxation from the first step
+Relaxation start time: 0.0
+
+# Output
+Output period: 1.0e-3

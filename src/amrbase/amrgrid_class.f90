@@ -187,6 +187,7 @@ module amrgrid_class
       procedure :: add_postregrid            !< Add a post-regrid callback
       procedure :: clear_tagging             !< Clear all tagging callbacks
       procedure :: clear_postregrid          !< Clear all post-regrid callbacks
+      procedure :: fire_postregrid           !< Manually fire all post-regrid callbacks
       procedure :: set_get_cost              !< Set cost callback for load balancing
       ! Various tools and accessors
       procedure :: get_boxarray              !< Obtain box array at a given level
@@ -677,6 +678,24 @@ contains
       end if
    end subroutine dispatch_err_est
 
+   !> Manually fire the registered post-regrid callbacks.
+   !> init_from_scratch fires these automatically, but init_from_checkpoint does not: it builds
+   !> the levels and returns, so consumers that cache layout-dependent state (amrlpt's particle
+   !> container ba/dm, amrccl's coverage mask) are never told the grids exist. Firing them inside
+   !> init_from_checkpoint would be wrong, since callbacks such as amrmpcomp's recompute primitives
+   !> from Q and would run before the solver restores Q. So a restarting case calls this itself,
+   !> AFTER the field data has been restored.
+   subroutine fire_postregrid(this,time)
+      use iso_c_binding, only: c_loc
+      implicit none
+      class(amrgrid), target, intent(inout) :: this
+      real(WP), intent(in) :: time
+      select type (this)
+       type is (amrgrid)
+         call dispatch_postregrid(c_loc(this), 0, time)
+      end select
+   end subroutine fire_postregrid
+
    subroutine dispatch_postregrid(owner, lbase, time) bind(c)
       use iso_c_binding, only: c_ptr, c_int, c_double, c_f_pointer
       implicit none
@@ -1071,8 +1090,8 @@ contains
       call amrex_finalize()
    end subroutine finalize_amrex
 
-   !> Rebuild a multifab and set to zero
-   subroutine mfab_rebuild(mf,ba,dm,nc,ng)
+   !> Rebuild a multifab and set to zero (cell-centered unless nodal is given)
+   subroutine mfab_rebuild(mf,ba,dm,nc,ng,nodal)
       use amrex_amr_module, only: amrex_multifab,amrex_multifab_build,amrex_multifab_destroy, &
       &                           amrex_boxarray,amrex_distromap
       implicit none
@@ -1080,8 +1099,9 @@ contains
       type(amrex_boxarray), intent(in) :: ba
       type(amrex_distromap), intent(in) :: dm
       integer, intent(in) :: nc,ng
+      logical, dimension(3), intent(in), optional :: nodal
       call amrex_multifab_destroy(mf)
-      call amrex_multifab_build(mf=mf,ba=ba,dm=dm,nc=nc,ng=ng)
+      call amrex_multifab_build(mf=mf,ba=ba,dm=dm,nc=nc,ng=ng,nodal=nodal)
       call mf%setval(0.0_WP)
    end subroutine mfab_rebuild
 

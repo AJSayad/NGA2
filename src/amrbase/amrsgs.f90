@@ -139,8 +139,10 @@ contains
 
    end subroutine get_vreman
 
-   !> Compute artificial bulk kinematic viscosity from velocity
-   !> Input:  U(Ucomp), V(Vcomp), W(Wcomp) velocity, C sound speed (cell-centered)
+   !> Compute artificial bulk kinematic viscosity from cell- or face-centered velocity
+   !> Input: U/V/W are either all cell-centered or staggered (x/y/z-face centered), detected from their nodal flags.
+   !> Staggered velocities need >=1 filled ghost cell; collocated velocities need >=2.
+   !> C is cell-centered. Staggered edge curls are squared before averaging to cell centers.
    !> Output: visc is cell-centered kinematic artificial viscosity (ncomp=1, ng>=1)
    subroutine get_viscartif(dt,visc,U,V,W,C,Ucomp,Vcomp,Wcomp,Ccomp,Cartif,max_cfl,nfilter)
       use amrex_amr_module, only: amrex_mfiter,amrex_box,amrex_multifab,amrex_multifab_destroy
@@ -163,7 +165,25 @@ contains
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW,pC,pVisc,pScratch
       real(WP) :: dxi,dyi,dzi,dx,dy,dz,max_visc,myCartif,CFLmax
       real(WP) :: dudy,dudz,dvdx,dvdz,dwdx,dwdy,vort,grad_div
-      integer :: lvl,i,j,k,nf,uc,vc,wc,cc
+      integer :: lvl,i,j,k,ii,jj,kk,nf,uc,vc,wc,cc
+      logical :: is_stag
+
+      ! Check velocity nodal locations
+      is_stag=.false.
+      check_velocity: block
+         logical, dimension(3) :: nU,nV,nW
+         nU=U%nodal; nV=V%nodal; nW=W%nodal
+         if (all(nU.eqv.[.true.,.false.,.false.]).and. &
+         &   all(nV.eqv.[.false.,.true.,.false.]).and. &
+         &   all(nW.eqv.[.false.,.false.,.true.])) then
+            is_stag=.true.
+            if (min(U%ng,V%ng,W%ng).lt.1) call die('[amrsgs::get_viscartif] staggered velocities need at least 1 ghost cell')
+         else if (.not.any(nU).and..not.any(nV).and..not.any(nW)) then
+            is_stag=.false.
+         else
+            call die('[amrsgs::get_viscartif] U/V/W must be staggered (face-centered) or collocated (cell-centered)')
+         end if
+      end block check_velocity
 
       ! Check visc
       if (visc%ncomp.ne.1) call die('[amrsgs::get_viscartif] visc must have exactly 1 component')
@@ -203,7 +223,13 @@ contains
             pScratch=>scratch%dataptr(mfi)
             bx=mfi%growntilebox(1)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               pScratch(i,j,k,1)=0.5_WP*(dxi*(pU(i+1,j,k,uc)-pU(i-1,j,k,uc))+dyi*(pV(i,j+1,k,vc)-pV(i,j-1,k,vc))+dzi*(pW(i,j,k+1,wc)-pW(i,j,k-1,wc)))
+               if (is_stag) then
+                  pScratch(i,j,k,1)=dxi*(pU(i+1,j,k,uc)-pU(i,j,k,uc)) &
+                  &               +dyi*(pV(i,j+1,k,vc)-pV(i,j,k,vc)) &
+                  &               +dzi*(pW(i,j,k+1,wc)-pW(i,j,k,wc))
+               else
+                  pScratch(i,j,k,1)=0.5_WP*(dxi*(pU(i+1,j,k,uc)-pU(i-1,j,k,uc))+dyi*(pV(i,j+1,k,vc)-pV(i,j-1,k,vc))+dzi*(pW(i,j,k+1,wc)-pW(i,j,k-1,wc)))
+               end if
             end do; end do; end do
          end do
          call visc%amr%mfiter_destroy(mfi)
@@ -220,15 +246,37 @@ contains
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                ! Only work in compression regions
                if (pScratch(i,j,k,1).ge.0.0_WP) cycle
-               ! Compute local vorticity
-               dudy=0.5_WP*dyi*(pU(i,j+1,k,uc)-pU(i,j-1,k,uc))
-               dudz=0.5_WP*dzi*(pU(i,j,k+1,uc)-pU(i,j,k-1,uc))
-               dvdx=0.5_WP*dxi*(pV(i+1,j,k,vc)-pV(i-1,j,k,vc))
-               dvdz=0.5_WP*dzi*(pV(i,j,k+1,vc)-pV(i,j,k-1,vc))
-               dwdx=0.5_WP*dxi*(pW(i+1,j,k,wc)-pW(i-1,j,k,wc))
-               dwdy=0.5_WP*dyi*(pW(i,j+1,k,wc)-pW(i,j-1,k,wc))
-               vort=(dwdy-dvdz)**2+(dudz-dwdx)**2+(dvdx-dudy)**2
-               ! Compute |grad(div)|
+               ! Compute local squared vorticity.
+               if (is_stag) then
+                  ! Each curl component lives on four surrounding parallel edges.
+                  ! Square there before averaging so alternating edge curls cannot cancel.
+                  vort=0.0_WP
+                  do kk=0,1; do jj=0,1
+                     dwdy=dyi*(pW(i,j+jj,k+kk,wc)-pW(i,j+jj-1,k+kk,wc))
+                     dvdz=dzi*(pV(i,j+jj,k+kk,vc)-pV(i,j+jj,k+kk-1,vc))
+                     vort=vort+(dwdy-dvdz)**2
+                  end do; end do
+                  do kk=0,1; do ii=0,1
+                     dudz=dzi*(pU(i+ii,j,k+kk,uc)-pU(i+ii,j,k+kk-1,uc))
+                     dwdx=dxi*(pW(i+ii,j,k+kk,wc)-pW(i+ii-1,j,k+kk,wc))
+                     vort=vort+(dudz-dwdx)**2
+                  end do; end do
+                  do jj=0,1; do ii=0,1
+                     dvdx=dxi*(pV(i+ii,j+jj,k,vc)-pV(i+ii-1,j+jj,k,vc))
+                     dudy=dyi*(pU(i+ii,j+jj,k,uc)-pU(i+ii,j+jj-1,k,uc))
+                     vort=vort+(dvdx-dudy)**2
+                  end do; end do
+                  vort=0.25_WP*vort
+               else
+                  dudy=0.5_WP*dyi*(pU(i,j+1,k,uc)-pU(i,j-1,k,uc))
+                  dudz=0.5_WP*dzi*(pU(i,j,k+1,uc)-pU(i,j,k-1,uc))
+                  dvdx=0.5_WP*dxi*(pV(i+1,j,k,vc)-pV(i-1,j,k,vc))
+                  dvdz=0.5_WP*dzi*(pV(i,j,k+1,vc)-pV(i,j,k-1,vc))
+                  dwdx=0.5_WP*dxi*(pW(i+1,j,k,wc)-pW(i-1,j,k,wc))
+                  dwdy=0.5_WP*dyi*(pW(i,j+1,k,wc)-pW(i,j-1,k,wc))
+                  vort=(dwdy-dvdz)**2+(dudz-dwdx)**2+(dvdx-dudy)**2
+               end if
+               ! Sum of mesh-scaled maximum one-sided divergence differences.
                grad_div=max(abs(pScratch(i+1,j,k,1)-pScratch(i,j,k,1)),abs(pScratch(i,j,k,1)-pScratch(i-1,j,k,1)))*dx**2 &
                &       +max(abs(pScratch(i,j+1,k,1)-pScratch(i,j,k,1)),abs(pScratch(i,j,k,1)-pScratch(i,j-1,k,1)))*dy**2 &
                &       +max(abs(pScratch(i,j,k+1,1)-pScratch(i,j,k,1)),abs(pScratch(i,j,k,1)-pScratch(i,j,k-1,1)))*dz**2

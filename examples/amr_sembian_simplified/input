@@ -1,6 +1,5 @@
 # =====================================================================
 #  Simplified Sembian shock-drop case (Ms=2.4 planar shock, water cylinder)
-#  All quantities are DIMENSIONAL (SI): m, s, kg, Pa
 #  Static uniform grid - no AMR
 # =====================================================================
 
@@ -13,10 +12,14 @@ Ly : 0.074
 # The mesh is uniform and isotropic (dx=dy=dz), Lx/Ly=1.5 so nx=1.5*ny.
 # CPD = cells across the initial drop diameter d0=0.022 m
 # ---------------------------------------------------------------------
-# ~305 CPD  (dx = 7.2266e-5 m)   [1536 x 1024 =  1.57 M cells]
-Base nx:   1536
-Base ny:   1024
+# ~152 CPD  (dx = 7.2266e-5 m)   [1536 x 1024 =  1.57 M cells]
+Base nx:   768
+Base ny:   512
 Base nz:   1
+# ~305 CPD  (dx = 7.2266e-5 m)   [1536 x 1024 =  1.57 M cells]
+!Base nx:   1536
+!Base ny:   1024
+!Base nz:   1
 # ~610 CPD  (dx = 3.6133e-5 m)   [3072 x 2048 =  6.29 M cells]
 !Base nx:   3072
 !Base ny:   2048
@@ -65,8 +68,14 @@ Surface tension coefficient : 0
 # Time integration
 Max dt:   2.5e-8
 Max CFL:  0.5
+Subiterations: 3       ! Iterative midpoint sub-iterations (2 = explicit midpoint)
 Max time: 2.0e-4
 Max wall time:     !14400    ! IN SECONDS
+
+# Staggered solver: band momentum flux and artificial bulk viscosity
+CTU alpha: 0.5                   
+Artificial viscosity coefficient: 5.0
+Max viscous CFL: 0.5
 
 # Output
 Output period:      1.0e-6   ! 100 frames over Max time
