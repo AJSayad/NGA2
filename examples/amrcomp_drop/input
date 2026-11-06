@@ -57,13 +57,6 @@ Sutherland temperature: 0.07286
 #Sutherland temperature: 0.2925
 ###########################################
 
-###########################################
-###### MOVING WALL MODEL FOR IMPACT #######
-###########################################
-#Wall location: -3.0
-#Wall velocity:  1.0
-###########################################
-
 # Spherical harmonics perturbation
 # SphHarm Nmode: 8
 # SphHarm l: 20 21 22 23 24 25 26 27
@@ -71,9 +64,15 @@ Sutherland temperature: 0.07286
 # SphHarm amp: 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3
 # SphHarm phase: 7.21700E-01  4.83624E+00  3.62682E+00  5.36249E+00  2.91468E+00  5.27352E+00  2.45123E+00  3.82910E+00
 
+# Sponge zone (relaxation toward the undisturbed solution, no viscosity)
+Sponge radius: 3.0
+Sponge length: 1.0
+Sponge rate:   1.0
+
 # Time integration
 Max dt:   1e-3
-Max CFL:  0.75
+Max CFL:  0.5
+Subiterations: 3       ! Iterative midpoint sub-iterations (2 = explicit midpoint)
 Max time: 100
 
 # Output

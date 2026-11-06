@@ -1,0 +1,186 @@
+# AMR grid
+Base nx:   32
+Base ny:   32
+Base nz:   1
+Max level: 5
+
+# Regridding parameters
+Regrid nsteps: 10
+Tag Reynolds value: 100
+Tag density error:  0.6
+Tag pressure error: 0.3
+Tag Ducros value:   0.5
+
+# Transverse sponge from 'Sponge radius' over 'Sponge length'; beyond it refinement drops one level per 16-cell band
+Sponge radius: 3.0
+Sponge length: 1.0
+
+###########################################
+##### CONDITIONS FOR PARZIALE Ms=5.12 #####
+###########################################
+# Gammas
+GammaG: 1.3
+GammaL: 2.805
+# Shock parameters
+Gas Mach number: 1.967391
+Shock location: -0.6
+# Liquid state
+Density ratio:      137.941042
+Liquid Mach number: 0.994382
+# Surface tension
+Weber number:       3.89e5
+# Viscous parameters
+Reynolds number:    3.815e5
+Prandtl number:     0.71
+Viscosity ratio:    17.239240
+Diffusivity ratio:  7.996515
+Sutherland exponent:    1.5
+Sutherland temperature: 0.07286
+###########################################
+
+###########################################
+###### CONDITIONS FOR SHARMA Ms=1.45 ######
+###########################################
+# Gammas
+#GammaG: 1.4
+#GammaL: 6.12
+# Shock parameters
+#Gas Mach number: 0.5585
+#Shock location: -0.6
+# Liquid state
+#Density ratio:      459.25
+#Liquid Mach number: 0.147
+# Surface tension
+#Weber number:       795
+# Viscous parameters
+#Reynolds number:    1.2e4
+#Prandtl number:     0.71
+#Viscosity ratio:    48.25
+#Diffusivity ratio:  19.118
+#Sutherland exponent:    1.5
+#Sutherland temperature: 0.2925
+###########################################
+
+###########################################
+###### MOVING WALL MODEL FOR IMPACT #######
+###########################################
+#Wall location: -3.0
+#Wall velocity:  1.0
+###########################################
+
+# Spherical harmonics perturbation
+# SphHarm Nmode: 8
+# SphHarm l: 20 21 22 23 24 25 26 27
+# SphHarm m:  0  7 -11 15 -5 20 -18 10
+# SphHarm amp: 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3 1e-3
+# SphHarm phase: 7.21700E-01  4.83624E+00  3.62682E+00  5.36249E+00  2.91468E+00  5.27352E+00  2.45123E+00  3.82910E+00
+
+# Time integration
+Max dt:   1e-3
+Max CFL:  0.75
+Subiterations: 3       ! Iterative midpoint sub-iterations (2 = explicit midpoint RK2, unstable on the imaginary axis)
+Max time: 100
+
+# Output
+Output period:     1e-1
+PLIC Output period: 1e-1
+tau Output period:  2.8775   ! This is 11.51/4
+Checkpoint period: 1
+Max wall time:     !14400    ! IN SECONDS
+Restart from:      !restart/drop_6.00000E+00
+
+# ---------------------------------------------------------------------
+# Sub-grid drop -> Lagrangian particle transfer
+#
+# A liquid structure is handed to the spray when it is BOTH
+#   (a) smaller than 'Drop transfer volume coeff' cell volumes at the finest level, and
+#   (b) outside the parent drop's bounding box grown by 'Drop transfer margin'.
+# The box is measured from the largest structure (amrccl guarantees that is id=1) using cell
+# corners; directions resolved by a single cell are ignored, so in quasi-2D the z direction
+# never disqualifies anything. This case is NON-DIMENSIONAL with d0 = 1, so the default margin
+# of 0.5*d0 is simply 0.5 in code units.
+#
+# COUPLING is two-way for momentum, deposited into the gas via lp%src -> face momenta. The energy
+# dissipated by drag (lp%src(4)) is currently NOT added to the gas energy Q(4). Convective (Gunn) heat transfer is written up but
+# COMMENTED OUT in four places - see 'GUNN HEAT TRANSFER (disabled)' in src/simulation.f90 and
+# in src/amrlpt/amrlpt_class.f90; enabling it needs the Particle<14,1> -> <15,1> layout change
+# documented there. MASS is one-way by nature: liquid that becomes a particle is gone from the
+# Eulerian field, as there is no phase-change model. monitor/spray carries the whole ledger.
+#
+# With volume coeff 24 and particle level offset 3, the largest equivalent sphere has
+# d/h_couple ~ 0.447 for the supplied geometry. Additional diffusion defaults to zero;
+# coarse trilinear deposition still spreads the reaction over the coupling stencil.
+# In this quasi-2D setup the maximum particle volume is 0.375 coupling-cell volumes.
+# Diameter ratio alone does not establish small self-disturbance or dilute local loading.
+# ---------------------------------------------------------------------
+Drop transfer:              .true.
+Drop transfer volume coeff: 24
+# As in shock_droplet, eligible structures with an equal-volume diameter below
+# this fraction of the receiving particle-grid spacing are discarded as flotsams.
+Drop transfer diameter threshold: 0.1
+Drop transfer nsteps:       10
+# Clearance beyond the core's bounding box; comment out to use the default of 0.5*d0 = 0.5
+!Drop transfer margin:      0.5
+
+# Spray solver
+# Osnes et al. (2023) is the only drag law in amrlpt that is in range at the Re_p these drops
+# see; Schiller-Naumann under-predicts drag by ~10x. Watch 'Re max'/'Ma max'/'Kn max' in
+# monitor/spray to confirm the model is being used inside its intended range.
+# Drag samples molecular gas viscosity and gas sound speed, not effective mixture
+# viscosity/sound speed. Gas-property interpolation is normalized by gas fraction;
+# pure-liquid cells have zero weight, and a gas-free particle stencil is an error.
+# Levels below 'Max level' that particles are capped to. The cap coarsens BOTH fluid
+# sampling and source deposition; the reaction is transferred to finer fluid levels.
+# For volume coeff 24 in the supplied geometry, the maximum diameter ratios are:
+#   offset 0: d/h ~ 3.58
+#   offset 2: d/h ~ 0.895
+#   offset 3: d/h ~ 0.447 (default)
+# The initialization check rejects a transfer threshold that exceeds 'Particle maximum d/dx'.
+# Watch 'd/dx couple' in monitor/spray to confirm the configured upper bound.
+Particle level offset: 3
+Particle maximum d/dx: 1.0
+
+Particle drag model:  Osnes
+Particle max CFL:     0.5
+!Particle max dt:     1e-3
+!Particle filter width: 0.5
+Particle collisions:  .false.
+!Particle collision time: 1e-2
+!Particle Cp:         1.0
+!Spray output period: 1e-1
+
+# ---------------------------------------------------------------------
+# Wake coarsening (off by default; the settings below are a suggested starting point)
+#
+# Of the four tagging criteria only the SGS cell-Reynolds test is a turbulence-RESOLUTION test,
+# and in a turbulent wake it never switches off - which is what keeps the wake refined far
+# downstream. These knobs make that one criterion progressively harder to satisfy with level and
+# with downstream distance, only inside the wake. With 'Wake tag density' enabled, the density
+# Laplacian shares the ramp and cap. Liquid pressure and Ducros criteria are not wake-ramped.
+# The density indicator is bounded by 1: a ramped threshold >= 1 disables that criterion.
+#
+#   Re_eff = Re_tag * (Wake tag ramp)^(lvl - Wake tag level)     for lvl above the level
+#                   * 2^((x - x_start)/Wake tag length)          for x beyond x_start
+#
+# Both multipliers apply only for x > x_start; upstream the original thresholds are retained.
+# Here x_start = max(Wake tag x0, downstream face of the transfer box). The ramp can never begin
+# upstream of the transfer boundary: inside that region drops are still tracked as VOF structures
+# rather than handed to the spray, so it is exactly the region that has to stay refined.
+#
+# 'Wake max level offset' is a true relative cap on refinement requested by the SGS-Re criterion
+# and, when 'Wake tag density' is true, by the density criterion inside the wake.  Other criteria
+# remain free to refine shocks and Eulerian liquid interfaces to Max level.  With Max level=6 and
+# offset=2, wake criteria can request grids through level 4 but cannot request levels 5 or 6.
+# AMReX grid clustering/proper nesting can still extend a fine box a short distance into the wake,
+# and independent shock/interface criteria are deliberately unaffected.
+#
+# Suggested: allow full turbulence refinement to level 2, then quadruple the threshold per level
+# while also imposing the explicit two-level wake cap, and double the threshold again every
+# 2 length units past x=1.
+# ---------------------------------------------------------------------
+Wake tag level:  2
+Wake tag ramp:   4.0
+Wake max level offset: 2
+Wake tag x0:     1.0
+Wake tag length: 2.0
+Wake tag density: .true.

@@ -69,6 +69,20 @@ module amrlpt_class
          integer(c_int), value :: lev_min,lev_max,ng
       end subroutine
 
+      subroutine amrlpt_enforce_max_level(pc,lev_max,number_demoted) bind(c)
+         import :: c_ptr,c_int,c_int64_t
+         type(c_ptr), value :: pc
+         integer(c_int), value :: lev_max
+         integer(c_int64_t) :: number_demoted
+      end subroutine
+
+      subroutine amrlpt_level_counts(pc,counts,nlevels) bind(c)
+         import :: c_ptr,c_int,c_int64_t
+         type(c_ptr), value :: pc
+         integer(c_int64_t), dimension(*) :: counts
+         integer(c_int), value :: nlevels
+      end subroutine
+
       subroutine amrlpt_fill_neighbors(pc,ngrow) bind(c)
          import :: c_ptr,c_int
          type(c_ptr), value :: pc
@@ -240,12 +254,20 @@ module amrlpt_class
 
       !> Global particle count
       integer(I8) :: np=0
+      integer(I8) :: np_demoted=0 !< Particles moved below maxlvl by the last explicit enforcement
+      integer :: occupied_minlvl=-1,occupied_maxlvl=-1
+      integer(I8) :: np_above_maxlvl=0
 
       !> Physics parameters
       real(WP) :: rho                                   !< Particle material density
+      real(WP) :: gas_gamma=1.4_WP                     !< Gas specific-heat ratio used by compressible drag laws
       real(WP), dimension(3) :: gravity=0.0_WP          !< Acceleration of gravity
       integer :: nstep=1                                !< Substeps per timestep
       character(len=str_medium) :: drag_model='Tenneti' !< Drag model
+      !> Optional prescribed solids fraction used only by the drag closure. A negative value keeps
+      !> the normal locally deposited particle VF. This is useful for isolated-particle/dilute-limit
+      !> verification without changing VF deposition or two-way source transfer.
+      real(WP) :: drag_vf_override=-1.0_WP
 
       !> Collision parameters
       real(WP) :: tau_col=1.0e-3_WP             !< Collision time scale
@@ -253,6 +275,14 @@ module amrlpt_class
       real(WP) :: e_w=1.0_WP                    !< Wall restitution
       real(WP) :: mu_f=0.0_WP                   !< Friction coefficient
       real(WP) :: clip_col=0.2_WP               !< Max overlap fraction
+
+      !> Drag-regime diagnostics: max particle Reynolds, Mach and Knudsen numbers seen during the
+      !> last advance. Worth watching - every drag model here has a limited range of validity.
+      real(WP) :: Remax=0.0_WP,Mamax=0.0_WP,Knmax=0.0_WP
+      !> Optional co-located records for the global Osnes Re/Ma/Kn extrema, disabled by default.
+      logical :: drag_diagnostics=.false.
+      logical :: drag_diagnostic_pending=.false.
+      real(WP), dimension(30,3) :: drag_diagnostic_record=0.0_WP
 
       !> CFL numbers
       real(WP) :: CFLp_x=0.0_WP,CFLp_y=0.0_WP,CFLp_z=0.0_WP
@@ -269,6 +299,22 @@ module amrlpt_class
       integer  :: np_new_loc=0,np_out_loc=0
       real(WP) :: Vp_new_loc=0.0_WP,Vp_out_loc=0.0_WP
       integer  :: ncol=0
+      
+      !> Engulfed-particle fallback: a particle whose whole sampling stencil is pure liquid is
+      !> treated as a neutrally-buoyant tracer in the liquid, using liquid properties in a
+      !> Schiller-Naumann law. Set visc_immersed to the liquid dynamic viscosity (required).
+      real(WP) :: visc_immersed=-1.0_WP
+      integer  :: nsub_max=1000              !< Cap on per-particle sub-steps within one step
+      !> Counters. np_immersed is PARTICLES treated in the most recent advance; np_immersed_tot
+      !> accumulates particle-advances over the run. E_immersed is the drag dissipation that was
+      !> NOT deposited, because the containing cell holds no gas to receive it.
+      integer  :: np_immersed=0,       np_immersed_loc=0
+      integer  :: np_immersed_tot=0
+      integer  :: np_substep_capped=0, np_substep_capped_loc=0
+      real(WP) :: E_immersed=0.0_WP,   E_immersed_loc=0.0_WP
+      !> First engulfed event of the current advance on this rank, for the log:
+      !> [lvl, pos(3), d, |vrel|, gas fraction min, gas fraction max]
+      real(WP), dimension(8) :: immersed_sample=0.0_WP
 
       !> Particle distribution across ranks
       integer(I8) :: np_loc=0           !< This rank's particle count
@@ -279,15 +325,21 @@ module amrlpt_class
       !> Overlap size
       integer :: nover=2
 
-      !> Maximum AMR level particles are allowed on (cap passed to AMReX
-      !> Redistribute as lev_max). Particles span levels [0, maxlvl] and AMReX
-      !> places each at the finest level covering its position. Defaults to
-      !> amr%maxlvl in initialize — set lower to keep particles below a
-      !> chosen refinement.
+      !> Maximum AMR level particles are allowed to occupy. Particles use the
+      !> fluid AMR hierarchy but are placed on the finest covering level in
+      !> [0,maxlvl]. Fluid sampling, VF deposition and two-way source deposition
+      !> consequently all occur on this capped particle level. Defaults to the
+      !> fluid maximum; applications may lower it to satisfy point-particle scale
+      !> separation. Explicit enforcement recovers particles placed above the cap
+      !> by AMReX's unrestricted checkpoint Restart().
       integer :: maxlvl=0
 
       !> Filter width
       real(WP) :: filter_width=0.0_WP
+      !> Cells across the filter width on the level the deposit is actually diffused on. The cost
+      !> of the explicit filter is ~0.54*(filter_width/dx)^2 sub-steps, so resolving the Gaussian
+      !> on the finest level is needlessly expensive; 4 cells is plenty for a smoothing kernel.
+      integer  :: filter_ncell=4
 
       !> Particle volume fraction
       type(amrdata) :: VF
@@ -295,7 +347,11 @@ module amrlpt_class
       !> VF threshold for tagging; disabled if <=0
       real(WP) :: VF_tag=-1.0_WP
 
-      !> Two-way coupling source terms
+      !> Two-way coupling source terms, 4 components. SIGN CONVENTION: src is what the FLUID
+      !> GAINS - 1:3 react to drag + optional resolved stress; 4 is drag dissipation delivered to the
+      !> fluid's internal energy. Values are TIME-INTEGRATED over the interval advance/advance_to
+      !> covered (impulse and energy per unit volume), not rates, so a consumer adding them to a
+      !> dQdt must divide by that interval.
       type(amrdata) :: src
 
       !> Boundary condition flags for collision detection
@@ -338,6 +394,8 @@ module amrlpt_class
       procedure :: get_cfl                !< Compute particle CFL numbers
       ! Utilities
       procedure :: redistribute           !< Call AMReX redistribute
+      procedure :: enforce_max_level      !< Recover particles already stored above maxlvl
+      procedure :: get_level_counts       !< Global real-particle count on every AMR level
       procedure :: fill_ghosts            !< Fill ghost particle buffer
       procedure :: fill_ghosts_radius     !< Fill ghosts with position-based filtering
       procedure :: clear_ghosts           !< Release ghost particle buffer
@@ -446,14 +504,18 @@ contains
       ! Force resync particle container with new ba/dm
       resync: block
          integer :: lvl
+         ! NOTE: this must cover EVERY fluid level, not just [0,maxlvl]. Capping the BA/DM sync
+         ! leaves the container's level structure inconsistent with AmrCore and the next regrid can
+         ! fail in MPI. enforce_max_level() below imposes the particle ceiling after this full sync.
          do lvl=0,this%amr%clvl()
             call this%set_particle_ba(lvl,this%amr%get_boxarray(lvl))
             call this%set_particle_dm(lvl,this%amr%get_distromap(lvl))
          end do
       end block resync
 
-      ! Redistribute particles onto new grid
-      call this%redistribute()
+      ! Redistribute onto the new grid while also recovering any particle that
+      ! an earlier unrestricted operation may have placed above maxlvl.
+      call this%enforce_max_level()
 
       ! Optionally rebalance particles with knapsack
       if (this%rebalance) then
@@ -585,14 +647,21 @@ contains
    ! ============================================================================
 
    !> Initialize amrlpt solver
-   subroutine initialize(this,amr,name)
+   subroutine initialize(this,amr,name,gas_gamma)
       use amrex_amr_module, only: amrex_bc_foextrap
+      use messager, only: die
       implicit none
       class(amrlpt), intent(inout) :: this
       class(amrgrid), target, intent(in) :: amr
       character(len=*), optional :: name
+      real(WP), intent(in), optional :: gas_gamma
       ! Assign solver name
       if (present(name)) this%name=trim(adjustl(name))
+      ! Store the thermodynamic property used by compressible drag correlations. Keep the
+      ! historical air value when callers do not provide it, but reject values that would make
+      ! the Osnes Mach/Knudsen corrections undefined.
+      if (present(gas_gamma)) this%gas_gamma=gas_gamma
+      if (this%gas_gamma.le.0.0_WP) call die('[amrlpt initialize] gas_gamma must be positive')
       ! Point to amr
       this%amr=>amr
       ! Default level cap: allow particles up to the AMR grid's max refinement
@@ -605,7 +674,7 @@ contains
       if (.not.this%amr%yper) then; this%VF%lo_bc(2,1)=amrex_bc_foextrap; this%VF%hi_bc(2,1)=amrex_bc_foextrap; end if
       if (.not.this%amr%zper) then; this%VF%lo_bc(3,1)=amrex_bc_foextrap; this%VF%hi_bc(3,1)=amrex_bc_foextrap; end if
       ! Initialize source terms
-      call this%src%initialize(amr=amr,name='src',ncomp=3,ng=this%nover); call this%src%register()
+      call this%src%initialize(amr=amr,name='src',ncomp=4,ng=this%nover); call this%src%register()
       if (.not.this%amr%xper) then; this%src%lo_bc(1,:)=amrex_bc_foextrap; this%src%hi_bc(1,:)=amrex_bc_foextrap; end if
       if (.not.this%amr%yper) then; this%src%lo_bc(2,:)=amrex_bc_foextrap; this%src%hi_bc(2,:)=amrex_bc_foextrap; end if
       if (.not.this%amr%zper) then; this%src%lo_bc(3,:)=amrex_bc_foextrap; this%src%hi_bc(3,:)=amrex_bc_foextrap; end if
@@ -875,19 +944,23 @@ contains
    !> Ucomp/Vcomp/Wcomp: component to use from each velocity field (optional, default 1)
    !> rhocomp/visccomp: component to use from rho/visc fields (optional, default 1)
    !> cst_rho/cst_visc: constant scalar alternatives to rho/visc amrdata
-   subroutine advance(this,dt,U,Ucomp,V,Vcomp,W,Wcomp,rho,rhocomp,visc,visccomp,cst_rho,cst_visc)
+   subroutine advance(this,dt,U,Ucomp,V,Vcomp,W,Wcomp,rho,rhocomp,visc,visccomp,snd,sndcomp,cst_rho,cst_visc,cst_snd,stress_div)
       use amrex_amr_module, only: amrex_distromap
       use amrex_distromap_module, only: operator(.eq.)
       use amrex_interface, only: amrmfab_parallel_add
+      use messager, only: die
       implicit none
       class(amrlpt), intent(inout) :: this
       real(WP), intent(in) :: dt
       type(amrdata), intent(in) :: U,V,W
-      type(amrdata), intent(in), optional :: rho,visc
-      real(WP),      intent(in), optional :: cst_rho,cst_visc
-      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp
+      type(amrdata), intent(in), optional :: rho,visc,snd
+      ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
+      type(amrdata), intent(in), optional :: stress_div
+      real(WP),      intent(in), optional :: cst_rho,cst_visc,cst_snd
+      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
       type(amrex_distromap), dimension(:), allocatable :: pdms
       logical :: any_dual_dm
+      type(amrdata), allocatable :: stress_pdm
       type(amrdata) :: U_pdm,V_pdm,W_pdm,rho_pdm,visc_pdm,VF_pdm,src_pdm
       integer :: lvl
 
@@ -901,6 +974,10 @@ contains
 
       ! Clone fields onto particle DMs if needed
       if (any_dual_dm) then
+         if (present(stress_div)) then
+            allocate(stress_pdm)
+            call stress_div%clone(stress_pdm,dm=pdms)
+         end if
          call U%clone(U_pdm,dm=pdms)
          call V%clone(V_pdm,dm=pdms)
          call W%clone(W_pdm,dm=pdms)
@@ -910,23 +987,27 @@ contains
          call this%src%clone(src_pdm,dm=pdms)
       end if
 
-      ! Reset sources
+      ! Reset sources and drag diagnostics
       call this%src%setval(0.0_WP)
       if (any_dual_dm) call src_pdm%setval(0.0_WP)
+      this%Remax=0.0_WP; this%Mamax=0.0_WP; this%Knmax=0.0_WP
+      this%drag_diagnostic_record=0.0_WP
+      this%drag_diagnostic_pending=this%drag_diagnostics
+      if (any_dual_dm.and.present(snd)) call die('[amrlpt advance] a gridded sound speed is not supported alongside particle rebalancing (dual grid) - use cst_snd or set rebalance=.false.')
 
       ! Perform one step
       if (any_dual_dm) then
          if (present(rho).and.present(visc)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm)
          else if (present(rho)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm)
          else if (present(visc)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm)
          else
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm)
          end if
       else
-         call this%step(dt=dt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp)
+         call this%step(dt=dt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div)
       end if
 
       ! Writeback src_pdm to src and clean up clones
@@ -934,6 +1015,10 @@ contains
          do lvl=0,this%amr%clvl()
             call amrmfab_parallel_add(this%src%mf(lvl),src_pdm%mf(lvl),1,1,this%src%mf(lvl)%ncomp(),0,0,this%amr%geom(lvl))
          end do
+         if (allocated(stress_pdm)) then
+            call stress_pdm%finalize()
+            deallocate(stress_pdm)
+         end if
          call U_pdm%finalize()
          call V_pdm%finalize()
          call W_pdm%finalize()
@@ -978,7 +1063,7 @@ contains
    !> Advance particles to a target time using CFL-limited sub-steps:
    !> Sub-step size is adapted from this%dt (persistent) using this%cflmax
    !> On exit, this%t=t_target and this%dt holds the last adapted sub-step
-   subroutine advance_to(this,time,do_collide,U,V,W,rho,visc,cst_rho,cst_visc,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,Gib,Gibcomp)
+   subroutine advance_to(this,time,do_collide,U,V,W,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,Gib,Gibcomp,stress_div,gas_fraction)
       use amrex_amr_module, only: amrex_distromap
       use amrex_distromap_module, only: operator(.eq.)
       use amrex_interface, only: amrmfab_parallel_add
@@ -988,15 +1073,20 @@ contains
       real(WP), intent(in) :: time
       logical,  intent(in) :: do_collide
       type(amrdata), intent(in) :: U,V,W
-      type(amrdata), intent(in), optional :: rho,visc
-      real(WP),      intent(in), optional :: cst_rho,cst_visc
-      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp
+      type(amrdata), intent(in), optional :: rho,visc,snd
+      ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
+      type(amrdata), intent(in), optional :: stress_div
+      real(WP),      intent(in), optional :: cst_rho,cst_visc,cst_snd
+      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
       type(amrdata), intent(in), optional :: Gib
+      ! Optional Eulerian gas fraction for normalized gas-property interpolation.
+      type(amrdata), intent(in), optional :: gas_fraction
       integer,       intent(in), optional :: Gibcomp
       real(WP) :: dt_done,mydt,cfl
       integer  :: n_sub,lvl
       type(amrex_distromap), dimension(:), allocatable :: pdms
       logical :: any_dual_dm
+      type(amrdata), allocatable :: stress_pdm
       type(amrdata) :: U_pdm,V_pdm,W_pdm,rho_pdm,visc_pdm,Gib_pdm,VF_pdm,src_pdm
 
       ! Validate time target
@@ -1015,7 +1105,13 @@ contains
       end do
 
       ! Clone fields onto particle DMs if needed (ONE TIME before sub-step loop)
+      if (any_dual_dm.and.present(gas_fraction)) &
+      & call die('[amrlpt advance_to] gas-fraction sampling requires the fluid particle DistributionMapping')
       if (any_dual_dm) then
+         if (present(stress_div)) then
+            allocate(stress_pdm)
+            call stress_div%clone(stress_pdm,dm=pdms)
+         end if
          call U%clone(U_pdm,dm=pdms)
          call V%clone(V_pdm,dm=pdms)
          call W%clone(W_pdm,dm=pdms)
@@ -1026,9 +1122,15 @@ contains
          call this%src%clone(src_pdm,dm=pdms)
       end if
 
-      ! Reset sources
+      ! Reset sources and drag diagnostics
       call this%src%setval(0.0_WP)
       if (any_dual_dm) call src_pdm%setval(0.0_WP)
+      this%Remax=0.0_WP; this%Mamax=0.0_WP; this%Knmax=0.0_WP
+      this%np_immersed_loc=0; this%np_substep_capped_loc=0
+      this%E_immersed_loc=0.0_WP; this%immersed_sample=0.0_WP
+      this%drag_diagnostic_record=0.0_WP
+      this%drag_diagnostic_pending=this%drag_diagnostics
+      if (any_dual_dm.and.present(snd)) call die('[amrlpt advance_to] a gridded sound speed is not supported alongside particle rebalancing (dual grid) - use cst_snd or set rebalance=.false.')
 
       ! Sub-step loop: inject, collide, step, accumulate src
       dt_done=0.0_WP; n_sub=0
@@ -1048,16 +1150,16 @@ contains
          ! Step particles
          if (any_dual_dm) then
             if (present(rho).and.present(visc)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm)
             else if (present(rho)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm)
             else if (present(visc)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm)
             else
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm)
             end if
          else
-            call this%step(dt=mydt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp)
+            call this%step(dt=mydt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div,gas_fraction=gas_fraction)
          end if
          ! Increment time and sub-step counter
          dt_done=dt_done+mydt; n_sub=n_sub+1
@@ -1068,6 +1170,10 @@ contains
          do lvl=0,this%amr%clvl()
             call amrmfab_parallel_add(this%src%mf(lvl),src_pdm%mf(lvl),1,1,this%src%mf(lvl)%ncomp(),0,0,this%amr%geom(lvl))
          end do
+         if (allocated(stress_pdm)) then
+            call stress_pdm%finalize()
+            deallocate(stress_pdm)
+         end if
          call U_pdm%finalize()
          call V_pdm%finalize()
          call W_pdm%finalize()
@@ -1097,6 +1203,22 @@ contains
       ! Advance particle time
       this%t=time
 
+      ! Reduce the engulfed-particle counters once per advance. Doing it here rather than in
+      ! get_info keeps the numbers meaningful when get_info is called more than once per step.
+      reduce_immersed: block
+         use mpi_f08,  only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_SUM
+         use parallel, only: MPI_REAL_WP
+         real(WP), dimension(3) :: ibuf
+         integer :: ierr
+         ibuf=[real(this%np_immersed_loc,WP),real(this%np_substep_capped_loc,WP),this%E_immersed_loc]
+         call MPI_ALLREDUCE(MPI_IN_PLACE,ibuf,3,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+         this%np_immersed      =nint(ibuf(1))
+         this%np_immersed_tot  =this%np_immersed_tot+nint(ibuf(1))
+         this%np_substep_capped=this%np_substep_capped+nint(ibuf(2))
+         this%E_immersed       =this%E_immersed+ibuf(3)
+         this%np_immersed_loc=0; this%np_substep_capped_loc=0; this%E_immersed_loc=0.0_WP
+      end block reduce_immersed
+
       ! Log particle advance
       log_particle_advance: block
          use iso_fortran_env, only: output_unit
@@ -1115,7 +1237,7 @@ contains
 
    !> Step all particles on all AMR levels by dt, deposit momentum source
    !> All amrdata arguments must be on the particle DM (caller ensures via clone)
-   subroutine step(this,dt,U,V,W,VF,src,rho,visc,cst_rho,cst_visc,Ucomp,Vcomp,Wcomp,rhocomp,visccomp)
+   subroutine step(this,dt,U,V,W,VF,src,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,stress_div,gas_fraction)
       use amrex_amr_module, only: amrex_mfiter,amrex_mfiter_build,amrex_mfiter_destroy
       use mathtools, only: Pi
       use messager,  only: die
@@ -1123,21 +1245,30 @@ contains
       class(amrlpt), intent(inout) :: this
       real(WP), intent(in) :: dt
       type(amrdata), intent(in) :: U,V,W,VF
+      type(amrdata), intent(in), optional :: gas_fraction
       type(amrdata), intent(inout) :: src
-      type(amrdata), intent(in), optional :: rho,visc
-      real(WP),      intent(in), optional :: cst_rho,cst_visc
-      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp
+      type(amrdata), intent(in), optional :: rho,visc,snd
+      ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
+      type(amrdata), intent(in), optional :: stress_div
+      real(WP),      intent(in), optional :: cst_rho,cst_visc,cst_snd
+      integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
 
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pRho,pVisc,pVolFrac,pSrc
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pRho,pVisc,pSnd,pVolFrac,pSrc,pStress,pGasFraction
       type(amrex_mfiter) :: mfi
       type(part), dimension(:), pointer :: p
       integer(I8) :: np_
-      integer :: lvl,i,uc,vc,wc,rhoc,viscc
+      integer :: lvl,i,uc,vc,wc,rhoc,viscc,sndc
       real(WP) :: dx,dy,dz,dxi,dyi,dzi,mydt,dt_done,Ip
-      real(WP), dimension(3) :: acc,dmom
+      real(WP), dimension(3) :: acc,dmom,acc_drag,dmom_drag
+      !> Slip velocity and acc_drag are retained from the midpoint RHS evaluation so
+      !> heating uses drag alone even when acc also includes resolved stress.
+      real(WP), dimension(3) :: vrel
+      real(WP), dimension(4) :: dsrc
       type(part) :: myp,pold
       logical :: is_stag
+      logical :: immersed_this_particle,immersed_now
+      integer :: nsub_p
 
       ! Start step timer
       call this%tmr_step%start()
@@ -1148,12 +1279,25 @@ contains
       wc=1; if (present(Wcomp)) wc=Wcomp
       rhoc =1; if (present(rhocomp))  rhoc =rhocomp
       viscc=1; if (present(visccomp)) viscc=visccomp
+      sndc =1; if (present(sndcomp))  sndc =sndcomp
+      ! Osnes needs a particle Mach number, hence a speed of sound
+      if (trim(this%drag_model).eq.'Osnes'.and..not.present(snd).and..not.present(cst_snd)) &
+      &   call die("[amrlpt step] drag_model='Osnes' requires snd or cst_snd")
 
       ! Validate: each of rho and visc must be provided in exactly one form
       if (.not.present(rho) .and..not.present(cst_rho))  call die('[amrlpt step] rho or cst_rho required')
       if (.not.present(visc).and..not.present(cst_visc)) call die('[amrlpt step] visc or cst_visc required')
 
+      if (present(stress_div)) then
+         if (any(stress_div%nodal).or.stress_div%ncomp.ne.3.or.stress_div%ng.lt.1) &
+         & call die('[amrlpt step] stress_div requires 3 cell-centered components and filled ghosts')
+      end if
+
       ! Check velocity nodal locations
+      if (present(gas_fraction)) then
+         if (any(gas_fraction%nodal).or.gas_fraction%ncomp.ne.1.or.gas_fraction%ng.lt.this%nover) &
+         & call die('[amrlpt step] gas_fraction requires one cell-centered component and particle ghost width')
+      end if
       check_velocity: block
          logical, dimension(3) :: nU,nV,nW
          nU=U%nodal; nV=V%nodal; nW=W%nodal
@@ -1187,6 +1331,9 @@ contains
             pW      =>W%mf(lvl)%dataptr(mfi)
             if (present(rho))  pRho =>rho%mf(lvl)%dataptr(mfi)
             if (present(visc)) pVisc=>visc%mf(lvl)%dataptr(mfi)
+            if (present(snd))  pSnd =>snd%mf(lvl)%dataptr(mfi)
+            if (present(stress_div)) pStress=>stress_div%mf(lvl)%dataptr(mfi)
+            if (present(gas_fraction)) pGasFraction=>gas_fraction%mf(lvl)%dataptr(mfi)
             pVolFrac=>VF%mf(lvl)%dataptr(mfi)
             pSrc    =>src%mf(lvl)%dataptr(mfi)
 
@@ -1199,11 +1346,18 @@ contains
                if (IAND(p(i)%flag,PART_MOVES+PART_EXCHANGES).eq.0) cycle
                ! Create copy of particle
                myp=p(i)
+               immersed_this_particle=.false.
                ! Time-integrate until dt_done=dt
-               dt_done=0.0_WP
+               dt_done=0.0_WP; nsub_p=0
                do while (dt_done.lt.dt)
                   mydt=min(myp%dt,dt-dt_done)
                   if (mydt.le.0.0_WP) mydt=dt-dt_done
+                  nsub_p=nsub_p+1
+                  if (nsub_p.ge.this%nsub_max) then                ! <-- add: backstop
+                     mydt=dt-dt_done
+                     this%np_substep_capped_loc=this%np_substep_capped_loc+1
+                  end if
+                  immersed_now=.false.
                   ! Remember the particle
                   pold=myp
                   ! Precompute moment of inertia for a sphere
@@ -1222,7 +1376,8 @@ contains
                      myp%angVel=pold%angVel+mydt*myp%Tcol/Ip
                   end if
 
-                  ! DEBUG: catch bad deposit
+                  ! Catch a particle that has left its deposit stencil (or gone NaN) within one
+                  ! sub-step - almost always a cflmax/dtmax that is too loose for the local flow
                   if (floor((myp%pos(1)-this%amr%xlo)*dxi-0.5_WP).lt.lbound(pSrc,1) .or. &
                   &   floor((myp%pos(1)-this%amr%xlo)*dxi-0.5_WP)+1.gt.ubound(pSrc,1) .or. &
                   &   myp%pos(1).ne.myp%pos(1)) then
@@ -1234,17 +1389,45 @@ contains
                      write(*,'(A,3ES18.10)') '    Acol=',myp%Acol
                      write(*,'(A,ES18.10)')  '      dt=',mydt
                      write(*,'(A,I0,A,I0)')  'pSrc x bounds: ',lbound(pSrc,1),' to ',ubound(pSrc,1)
-                     error stop 'BAD DEPOSIT'
+                     call die('[amrlpt step] particle left its deposit stencil in one sub-step - tighten cflmax/dtmax')
                   end if
 
-                  ! Transfer back to the mesh
+                  ! Transfer back to the mesh. src is what the FLUID gains: minus the impulse the
+                  ! particle took (drag + resolved stress), plus drag-only dissipation. Component 4 is
+                  ! mydt*mp*|vrel|^2/tau. As in shock_droplet, no separate resolved-stress
+                  ! work correction is supplied; this is not an exact total-energy closure.
                   if (IAND(myp%flag,PART_EXCHANGES).ne.0) then
                      dmom=mydt*acc*this%rho*Pi/6.0_WP*myp%d**3
-                     call deposit(val=-dmom)
+                     dsrc(1:3)=-dmom
+                     dmom_drag=mydt*acc_drag*this%rho*Pi/6.0_WP*myp%d**3
+                     dsrc(4)  =dot_product(dmom_drag,vrel)
+                     if (immersed_now) then                        ! <-- add
+                        ! src(4) feeds the GAS internal energy. A pure-liquid cell holds
+                        ! essentially none, so this deposit would blow up IG and TG. Ledger it
+                        ! instead. Momentum still goes to Q(5:7), the mixture momentum, which is
+                        ! the liquid's here, so that exchange stays exact.
+                        this%E_immersed_loc=this%E_immersed_loc+dsrc(4)
+                        dsrc(4)=0.0_WP
+                     end if
+                     ! THERMAL COUPLING (disabled): convective heat transfer would subtract the
+                     ! heat the drop absorbs, dsrc(4)=dsrc(4)-mydt*mp*this%Cp*dTdt, with dTdt from
+                     ! a Gunn (1978) Nusselt correlation in get_rhs. Enabling it needs a particle
+                     ! temperature, i.e. Particle<14,1> -> <15,1>, which must move in lockstep:
+                     !   * AMRLPT_NREAL here, and the #define in amrlpt_wrapper.cpp
+                     !   * the part struct (append T after dt, before idcpu)
+                     !   * the plotfile name list in amrlpt_wrapper.cpp (NOT 't*' - taken by torque)
+                     !   * a select_comp case in amrlptviz_class.f90 (it has no case default, so a
+                     !     typo there fails silently)
+                     !   * every site that builds a pnew array must set the new field
+                     ! Existing particle checkpoints become unreadable. Add a static_assert on
+                     ! sizeof(PT) next to 'using PT' at the same time - there is no size handshake.
+                     call deposit(val=dsrc)
                   end if
                   ! Increment
                   dt_done=dt_done+mydt
                end do
+               ! Count the particle once if it was engulfed at any point this step   <-- add
+               if (immersed_this_particle) this%np_immersed_loc=this%np_immersed_loc+1
                ! Track escape from non-periodic boundaries
                if ((.not.this%amr%xper.and.(myp%pos(1).lt.this%amr%xlo.or.myp%pos(1).gt.this%amr%xhi)).or. &
                &   (.not.this%amr%yper.and.(myp%pos(2).lt.this%amr%ylo.or.myp%pos(2).gt.this%amr%yhi)).or. &
@@ -1271,9 +1454,14 @@ contains
 
       !> Calculate rhs of particle equations of motion
       function get_rhs() result(acc)
+         use mathtools, only: Pi
          real(WP), dimension(3) :: acc,fvel
-         real(WP) :: pVF,fVF,frho,fvisc,Re,tau,corr,b1,b2
+         integer :: c
+         real(WP), dimension(30) :: diag_record
+         real(WP) :: pVF,fVF,frho,fvisc,fC,Re,tau,corr,b1,b2,diag_Re,diag_Ma,diag_Kn
          real(WP) :: wx,wy,wz,fx,fy,fz
+         real(WP) :: gas_weights(0:1,0:1,0:1),gas_sum
+         integer :: a,b,cg
          integer  :: ic,jc,kc,ix,iy,iz
          ! Cell-centered stencil indices and weights
          ic=floor((myp%pos(1)-this%amr%xlo)*dxi-0.5_WP); wx=(myp%pos(1)-this%amr%xlo)*dxi-0.5_WP-real(ic,WP)
@@ -1305,9 +1493,80 @@ contains
             fvisc=(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz)*pVisc(ic,jc,kc,viscc)+wx*(1.0_WP-wy)*(1.0_WP-wz)*pVisc(ic+1,jc,kc,viscc)+(1.0_WP-wx)*wy*(1.0_WP-wz)*pVisc(ic,jc+1,kc,viscc)+wx*wy*(1.0_WP-wz)*pVisc(ic+1,jc+1,kc,viscc)+(1.0_WP-wx)*(1.0_WP-wy)*wz*pVisc(ic,jc,kc+1,viscc)+wx*(1.0_WP-wy)*wz*pVisc(ic+1,jc,kc+1,viscc)+(1.0_WP-wx)*wy*wz*pVisc(ic,jc+1,kc+1,viscc)+wx*wy*wz*pVisc(ic+1,jc+1,kc+1,viscc)
          end if
          fvisc=fvisc+epsilon(1.0_WP)
+         ! Speed of sound (only needed by compressible drag laws)
+         fC=0.0_WP
+         if (present(cst_snd)) then
+            fC=cst_snd
+         else if (present(snd)) then
+            fC=(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz)*pSnd(ic,jc,kc,sndc)+wx*(1.0_WP-wy)*(1.0_WP-wz)*pSnd(ic+1,jc,kc,sndc)+(1.0_WP-wx)*wy*(1.0_WP-wz)*pSnd(ic,jc+1,kc,sndc)+wx*wy*(1.0_WP-wz)*pSnd(ic+1,jc+1,kc,sndc)+(1.0_WP-wx)*(1.0_WP-wy)*wz*pSnd(ic,jc,kc+1,sndc)+wx*(1.0_WP-wy)*wz*pSnd(ic+1,jc,kc+1,sndc)+(1.0_WP-wx)*wy*wz*pSnd(ic,jc+1,kc+1,sndc)+wx*wy*wz*pSnd(ic+1,jc+1,kc+1,sndc)
+         end if
+         ! Gas properties must not be diluted by zero-valued pure-liquid entries. Keep the
+         ! ordinary interpolation unchanged for callers that do not supply a gas fraction.
+         if (present(gas_fraction)) then
+            do cg=0,1; do b=0,1; do a=0,1
+               gas_weights(a,b,cg)=merge(wx,1.0_WP-wx,a.eq.1)*merge(wy,1.0_WP-wy,b.eq.1) &
+               & *merge(wz,1.0_WP-wz,cg.eq.1)*pGasFraction(ic+a,jc+b,kc+cg,1)
+            end do; end do; end do
+            !gas_sum=sum(gas_weights)
+            !if (.not.(gas_sum.gt.0.0_WP)) call die('[amrlpt step] particle sampling stencil contains no valid gas')
+            !gas_weights=gas_weights/gas_sum
+            gas_sum=sum(gas_weights)
+            if (.not.(gas_sum.gt.0.0_WP)) then
+               ! ENGULFED: the whole stencil is pure liquid, so there is no gas state to build a
+               ! drag law from. The particle is made of the same liquid that surrounds it, so it
+               ! is neutrally buoyant: use the liquid's own density and viscosity in a
+               ! Schiller-Naumann law (Osnes is a compressible GAS correlation and its Mach number
+               ! would be meaningless here). tau is physical and dt-independent, and far above the
+               ! flow step, so this cannot drive the sub-step loop. The resolved stress term below
+               ! is the local liquid acceleration, since rho_p = rho_liquid.
+               if (this%visc_immersed.le.0.0_WP) &
+               &   call die('[amrlpt step] engulfed particle needs visc_immersed (liquid dynamic viscosity)')
+               immersed_now=.true.
+               frho =this%rho
+               fvisc=this%visc_immersed
+               vrel =fvel-myp%vel
+               Re   =frho*norm2(vrel)*myp%d/fvisc+epsilon(1.0_WP)
+               corr =1.0_WP+0.15_WP*Re**(0.687_WP)
+               tau  =this%rho*myp%d**2/(18.0_WP*fvisc*corr)
+               acc_drag=vrel/tau
+               acc  =acc_drag
+               if (present(stress_div)) then
+                  do c=1,3
+                     acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/this%rho
+                  end do
+               end if
+               myp%dt=tau/real(this%nstep,WP)
+               if (.not.immersed_this_particle) then
+                  immersed_this_particle=.true.
+                  if (this%np_immersed_loc.lt.5) then
+                     report_immersed: block
+                        use iso_fortran_env, only: output_unit
+                        real(WP) :: gasmin,gasmax
+                        gasmin=minval(pGasFraction(ic:ic+1,jc:jc+1,kc:kc+1,1))
+                        gasmax=maxval(pGasFraction(ic:ic+1,jc:jc+1,kc:kc+1,1))
+                        this%immersed_sample=[real(lvl,WP),myp%pos,myp%d,norm2(vrel),gasmin,gasmax]
+                        write(output_unit,'(" [",a,"] rank ",i0," engulfed particle: lvl=",i0, &
+                        &   " pos=",3es12.5," d=",es12.5," |vrel|=",es12.5," Re_l=",es12.5, &
+                        &   " tau=",es12.5," t=",es12.5)') &
+                        &   trim(this%name),this%amr%rank,lvl,myp%pos,myp%d,norm2(vrel),Re,tau,this%t
+                        flush(output_unit)
+                     end block report_immersed
+                  end if
+               end if
+               return
+            end if
+            gas_weights=gas_weights/gas_sum
+            if (.not.present(cst_rho)) frho=sum(gas_weights*pRho(ic:ic+1,jc:jc+1,kc:kc+1,rhoc))
+            if (.not.present(cst_visc)) fvisc=sum(gas_weights*pVisc(ic:ic+1,jc:jc+1,kc:kc+1,viscc))+epsilon(1.0_WP)
+            if (present(snd).and..not.present(cst_snd)) fC=sum(gas_weights*pSnd(ic:ic+1,jc:jc+1,kc:kc+1,sndc))
+         end if
+         fC=fC+epsilon(1.0_WP)
          ! Volume fraction
          pVF=(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz)*pVolFrac(ic,jc,kc,1)+wx*(1.0_WP-wy)*(1.0_WP-wz)*pVolFrac(ic+1,jc,kc,1)+(1.0_WP-wx)*wy*(1.0_WP-wz)*pVolFrac(ic,jc+1,kc,1)+wx*wy*(1.0_WP-wz)*pVolFrac(ic+1,jc+1,kc,1)+(1.0_WP-wx)*(1.0_WP-wy)*wz*pVolFrac(ic,jc,kc+1,1)+wx*(1.0_WP-wy)*wz*pVolFrac(ic+1,jc,kc+1,1)+(1.0_WP-wx)*wy*wz*pVolFrac(ic,jc+1,kc+1,1)+wx*wy*wz*pVolFrac(ic+1,jc+1,kc+1,1)
+         if (this%drag_vf_override.ge.0.0_WP) pVF=this%drag_vf_override
+         pVF=min(max(pVF,0.0_WP),1.0_WP-epsilon(1.0_WP))
          fVF=max(1.0_WP-pVF,epsilon(1.0_WP))
+         diag_Re=0.0_WP; diag_Ma=0.0_WP; diag_Kn=0.0_WP
          ! Drag correction factor
          select case(trim(this%drag_model))
          case('None','none')
@@ -1322,6 +1581,71 @@ contains
             b1=5.81_WP*pVF/fVF**3+0.48_WP*pVF**(1.0_WP/3.0_WP)/fVF**4
             b2=pVF**3*Re*(0.95_WP+0.61_WP*pVF**3/fVF**2)
             corr=fVF*((1.0_WP+0.15_WP*Re**(0.687_WP))/fVF**3+b1+b2)
+         case('Osnes') ! Osnes et al. (2023) IJMF - valid to high Re and transonic Ma
+            osnes: block
+               real(WP) :: Rep,Rem,Ma,Knp,fKn,CD1,CD2,CD3,sDrag,GM,HM,JM,CM,b3,vp
+               Rep=frho*norm2(myp%vel-fvel)*myp%d/fvisc+epsilon(1.0_WP)
+               Ma =norm2(myp%vel-fvel)/fC+epsilon(1.0_WP)
+               ! Evaluate Ma/Re algebraically from the sampled properties. This remains finite
+               ! at zero slip, where forming the ratio from separately epsilon-regularized Ma
+               ! and Re would return a spurious O(1) Knudsen number.
+               Knp=sqrt(0.5_WP*Pi*this%gas_gamma)*fvisc/(frho*fC*myp%d)
+               diag_Re=Rep; diag_Ma=Ma; diag_Kn=Knp
+               if (Rep.le.45.0_WP) then
+                  ! Rarefaction-dominated regime
+                  fKn=1.0_WP/(1.0_WP+Knp*(2.514_WP+0.8_WP*exp(-0.55_WP/Knp)))
+                  CD1=(1.0_WP+0.15_WP*Rep**(0.687_WP))*fKn
+                  ! The free-molecular expression below contains cancelling O(Ma^-3) terms.
+                  ! Its contribution to corr is O(Ma^4), so use the analytic continuum-Mach
+                  ! limit when it is negligible rather than evaluating an ill-conditioned form.
+                  if (Ma.lt.1.0e-3_WP) then
+                     corr=CD1
+                  else
+                     sDrag=Ma*sqrt(0.5_WP*this%gas_gamma)
+                     if (Ma.le.1.0_WP) then
+                        JM=2.26_WP-0.1_WP/Ma+0.14_WP/Ma**3
+                     else
+                        JM=1.6_WP+0.25_WP/Ma+0.11_WP/Ma**2+0.44_WP/Ma**3
+                     end if
+                     CD2=(1.0_WP+2.0_WP*sDrag**2)*exp(-sDrag**2)/(sDrag**3*sqrt(Pi)+epsilon(1.0_WP)) &
+                     &  +(4.0_WP*sDrag**4+4.0_WP*sDrag**2-1.0_WP)*erf(sDrag)/(2.0_WP*sDrag**4+epsilon(1.0_WP)) &
+                     &  +2.0_WP/(3.0_WP*sDrag+epsilon(1.0_WP))*sqrt(Pi)
+                     CD2=CD2/(1.0_WP+(CD2/JM-1.0_WP)*sqrt(Rep/45.0_WP))
+                     corr=CD1/(1.0_WP+Ma**4)+Rep/24.0_WP*Ma**4*CD2/(1.0_WP+Ma**4)
+                  end if
+                  CD3=corr*24.0_WP/Rep
+               else
+                  ! Compression-dominated regime
+                  if (Ma.lt.1.5_WP) then
+                     CM=1.65_WP+0.65_WP*tanh(4.0_WP*Ma-3.4_WP)
+                  else
+                     CM=2.18_WP-0.13_WP*tanh(0.9_WP*Ma-2.7_WP)
+                  end if
+                  if (Ma.lt.0.8_WP) then
+                     GM=166.0_WP*Ma**3+3.29_WP*Ma**2-10.9_WP*Ma+20.0_WP
+                  else
+                     GM=5.0_WP+40.0_WP*Ma**(-3.0_WP)
+                  end if
+                  if (Ma.lt.1.0_WP) then
+                     HM=0.0239_WP*Ma**3+0.212_WP*Ma**2-0.074_WP*Ma+1.0_WP
+                  else
+                     HM=0.93_WP+1.0_WP/(3.5_WP+Ma**5)
+                  end if
+                  ! CD3 is the drag coefficient, not the Stokes correction factor.
+                  ! The Rep/24 conversion is applied once below when corr is formed.
+                  CD3=24.0_WP/Rep*(1.0_WP+0.15_WP*Rep**(0.687_WP))*HM+ &
+                  &   0.42_WP*CM/(1.0_WP+42500.0_WP/Rep**(1.16_WP*CM)+GM/sqrt(Rep))
+               end if
+               ! Volume-fraction correction
+               vp=min(0.4_WP,pVF)
+               CD3=CD3/(1.0_WP-vp)
+               Rem=(1.0_WP-vp)*Rep
+               b1=(5.81_WP*vp/(1.0_WP-vp)**2+0.48_WP*vp**(1.0_WP/3.0_WP)/(1.0_WP-vp)**3)*(1.0_WP-vp)
+               b2=(1.0_WP-vp)*(vp**3*Rem*(0.95_WP+0.61_WP*vp**3/(1.0_WP-vp)**2))*(1.0_WP-vp)
+               b3=min(sqrt(20.0_WP*Ma),1.0_WP)*(5.65_WP*vp-22.0_WP*vp**2+23.4_WP*vp**3) &
+               &  *(1.0_WP+tanh((Ma-(0.65_WP-0.24_WP*vp))/0.35_WP))
+               corr=CD3*Rep/24.0_WP+b1+b2+b3*Rep/24.0_WP
+            end block osnes
          case('Beetstra') ! Beetstra et al. (2007)
             Re=fVF*frho*norm2(myp%vel-fvel)*myp%d/fvisc+epsilon(1.0_WP)
             b1=10.0_WP*pVF/fVF**2+fVF**2*(1.0_WP+1.5_WP*sqrt(pVF))
@@ -1332,16 +1656,40 @@ contains
          end select
          ! Particle response time
          tau=this%rho*myp%d**2/(18.0_WP*fvisc*corr)
-         ! Return acceleration and update particle timestep size
-         acc=(fvel-myp%vel)/tau
+         ! Return acceleration and update particle timestep size. vrel is handed back to step
+         ! by host association so the dissipation it deposits matches this acc exactly.
+         vrel=fvel-myp%vel
+         acc_drag=vrel/tau
+         acc=acc_drag
+         if (present(stress_div)) then
+            do c=1,3
+               acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/this%rho
+            end do
+         end if
          myp%dt=tau/real(this%nstep,WP)
+         ! Save co-located inputs for the local Re/Ma/Kn extrema. get_info identifies the global
+         ! winners and prints only those records in MPI-rank order, avoiding interleaved traces.
+         if (trim(this%drag_model).eq.'Osnes') then
+            if (this%drag_diagnostics) then
+               diag_record=[this%t,dt,dt_done,mydt,real(lvl,WP),myp%pos,myp%vel,fvel,vrel, &
+               &            norm2(vrel),myp%d,frho,fvisc,fC,pVF,fVF,diag_Re,diag_Ma,diag_Kn, &
+               &            this%gas_gamma,corr,tau]
+               if (diag_Re.gt.this%Remax) this%drag_diagnostic_record(:,1)=diag_record
+               if (diag_Ma.gt.this%Mamax) this%drag_diagnostic_record(:,2)=diag_record
+               if (diag_Kn.gt.this%Knmax) this%drag_diagnostic_record(:,3)=diag_record
+            end if
+            this%Remax=max(this%Remax,diag_Re)
+            this%Mamax=max(this%Mamax,diag_Ma)
+            this%Knmax=max(this%Knmax,diag_Kn)
+         end if
       end function get_rhs
 
       !> Deposit a particle source term back to the mesh
       subroutine deposit(val)
-         real(WP), dimension(3), intent(in) :: val
+         real(WP), dimension(4), intent(in) :: val
          real(WP) :: wx,wy,wz
-         integer  :: ic,jc,kc
+         real(WP), dimension(2,2,2) :: w
+         integer  :: ic,jc,kc,n
          ! Cell-centered stencil indices and weights
          ic=floor((myp%pos(1)-this%amr%xlo)*dxi-0.5_WP); wx=(myp%pos(1)-this%amr%xlo)*dxi-0.5_WP-real(ic,WP)
          jc=floor((myp%pos(2)-this%amr%ylo)*dyi-0.5_WP); wy=(myp%pos(2)-this%amr%ylo)*dyi-0.5_WP-real(jc,WP)
@@ -1353,10 +1701,14 @@ contains
          if (this%hi_bc(2).eq.AMRLPT_WALL.and.jc+1.gt.this%amr%geom(lvl)%domain%hi(2)) then; jc=this%amr%geom(lvl)%domain%hi(2)-1; wy=1.0_WP; end if
          if (this%lo_bc(3).eq.AMRLPT_WALL.and.kc  .lt.this%amr%geom(lvl)%domain%lo(3)) then; kc=this%amr%geom(lvl)%domain%lo(3)  ; wz=0.0_WP; end if
          if (this%hi_bc(3).eq.AMRLPT_WALL.and.kc+1.gt.this%amr%geom(lvl)%domain%hi(3)) then; kc=this%amr%geom(lvl)%domain%hi(3)-1; wz=1.0_WP; end if
-         ! Add to source
-         pSrc(ic:ic+1,jc:jc+1,kc:kc+1,1)=pSrc(ic:ic+1,jc:jc+1,kc:kc+1,1)+reshape([(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz),wx*(1.0_WP-wy)*(1.0_WP-wz),(1.0_WP-wx)*wy*(1.0_WP-wz),wx*wy*(1.0_WP-wz),(1.0_WP-wx)*(1.0_WP-wy)*wz,wx*(1.0_WP-wy)*wz,(1.0_WP-wx)*wy*wz,wx*wy*wz],[2,2,2])*val(1)
-         pSrc(ic:ic+1,jc:jc+1,kc:kc+1,2)=pSrc(ic:ic+1,jc:jc+1,kc:kc+1,2)+reshape([(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz),wx*(1.0_WP-wy)*(1.0_WP-wz),(1.0_WP-wx)*wy*(1.0_WP-wz),wx*wy*(1.0_WP-wz),(1.0_WP-wx)*(1.0_WP-wy)*wz,wx*(1.0_WP-wy)*wz,(1.0_WP-wx)*wy*wz,wx*wy*wz],[2,2,2])*val(2)
-         pSrc(ic:ic+1,jc:jc+1,kc:kc+1,3)=pSrc(ic:ic+1,jc:jc+1,kc:kc+1,3)+reshape([(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz),wx*(1.0_WP-wy)*(1.0_WP-wz),(1.0_WP-wx)*wy*(1.0_WP-wz),wx*wy*(1.0_WP-wz),(1.0_WP-wx)*(1.0_WP-wy)*wz,wx*(1.0_WP-wy)*wz,(1.0_WP-wx)*wy*wz,wx*wy*wz],[2,2,2])*val(3)
+         ! Add to source - one trilinear weight set, applied to every component
+         w=reshape([(1.0_WP-wx)*(1.0_WP-wy)*(1.0_WP-wz),wx*(1.0_WP-wy)*(1.0_WP-wz), &
+         &          (1.0_WP-wx)*        wy *(1.0_WP-wz),wx*        wy *(1.0_WP-wz), &
+         &          (1.0_WP-wx)*(1.0_WP-wy)*        wz ,wx*(1.0_WP-wy)*        wz , &
+         &          (1.0_WP-wx)*        wy *        wz ,wx*        wy *        wz ],[2,2,2])
+         do n=1,4
+            pSrc(ic:ic+1,jc:jc+1,kc:kc+1,n)=pSrc(ic:ic+1,jc:jc+1,kc:kc+1,n)+w*val(n)
+         end do
       end subroutine deposit
 
    end subroutine step
@@ -1499,11 +1851,39 @@ contains
       integer, intent(in), optional :: minlvl,maxlvl,nover
       integer :: lmin,lmax,no
       lmin=0;           if (present(minlvl)) lmin=minlvl
-      lmax=this%maxlvl; if (present(maxlvl)) lmax=maxlvl
+      ! Default to the hierarchy as it stands, not to the configured ceiling: AMReX asserts
+      ! lev_max <= finestLevel(), which this%maxlvl violates whenever the levels above the
+      ! current finest have not been built yet (e.g. right after init_from_scratch)
+      lmax=min(this%maxlvl,this%amr%clvl()); if (present(maxlvl)) lmax=maxlvl
       no  =0;           if (present(nover))  no  =nover
       call amrlpt_redistribute(this%pc,lmin,lmax,no)
       call amrlpt_total_np(this%pc,this%np)
    end subroutine redistribute
+
+   !> Enforce the configured particle level cap, including for particles that
+   !> already reside above it. This stronger operation is intended for restart
+   !> and regrid boundaries; ordinary per-step redistribution only needs to
+   !> visit levels [0,maxlvl] once this invariant has been established.
+   subroutine enforce_max_level(this)
+      implicit none
+      class(amrlpt), intent(inout) :: this
+      integer :: cap
+      cap=min(this%maxlvl,this%amr%clvl())
+      call amrlpt_enforce_max_level(this%pc,cap,this%np_demoted)
+      call amrlpt_total_np(this%pc,this%np)
+   end subroutine enforce_max_level
+
+   !> Return the global number of real particles stored on each AMR level.
+   subroutine get_level_counts(this,counts)
+      use messager, only: die
+      implicit none
+      class(amrlpt), intent(in) :: this
+      integer(I8), dimension(0:), intent(out) :: counts
+      integer :: nlevels
+      nlevels=this%amr%clvl()+1
+      if (size(counts).ne.nlevels) call die('[amrlpt get_level_counts] output extent must equal clvl()+1')
+      call amrlpt_level_counts(this%pc,counts,nlevels)
+   end subroutine get_level_counts
 
    !> Fill ghost particle buffer within no cells
    subroutine fill_ghosts(this,no)
@@ -1695,7 +2075,12 @@ contains
       class(amrlpt), intent(inout) :: this
       type(amrdata), intent(inout) :: A
       type(amrex_multifab), dimension(:), allocatable :: tmp
-      integer :: lvl
+      integer :: lvl,dlvl
+      ! Deposit ceiling: particles are capped at this%maxlvl, so levels above it hold NO deposit.
+      ! Every pass below must stop there. Walking up to clvl() instead would interpolate from, and
+      ! then average back down from, levels that are identically zero - which silently erases the
+      ! whole deposit wherever finer levels cover it. Reduces to clvl() when maxlvl is not capped.
+      dlvl=min(this%amr%clvl(),this%maxlvl)   ! = clvl unless a caller has capped placement
       ! Convert extensive deposits to intensive
       do lvl=0,this%amr%clvl()
          call A%mf(lvl)%mult(1.0_WP/this%amr%cell_vol(lvl),1,A%ncomp,A%ng)
@@ -1706,11 +2091,11 @@ contains
          call this%amr%mfab_build(lvl,tmp(lvl),ncomp=A%ncomp,nover=0); call tmp(lvl)%setval(0.0_WP)
       end do
       ! Forward pass (coarse to fine)
-      do lvl=0,this%amr%clvl()
+      do lvl=0,dlvl
          ! SumBoundary: ghost→valid at this level
          call A%syncsum_lvl(lvl)
          ! InterpFromCoarseLevel: propagate coarse deposit to fine tmp
-         if (lvl.lt.this%amr%clvl()) then
+         if (lvl.lt.dlvl) then
             call amrmfab_interp_from_coarse(tmp(lvl+1),A%mf(lvl),[this%amr%rrefx(lvl),this%amr%rrefy(lvl),this%amr%rrefz(lvl)],cgeom=this%amr%geom(lvl),fgeom=this%amr%geom(lvl+1),scomp=1,ncomp=A%ncomp)
          end if
          ! Sum_fine_to_coarse: fine→coarse ADD
@@ -1720,9 +2105,19 @@ contains
          ! Add interpolated coarse contribution to this level
          call A%mf(lvl)%add(tmp(lvl),1,1,A%ncomp,0)
       end do
-      ! Backward pass: average_down fixes double-counting in covered cells
-      do lvl=this%amr%clvl()-1,0,-1
+      ! Backward pass: average_down fixes double-counting in covered cells. Starts at dlvl-1, not
+      ! clvl()-1: levels above dlvl are empty and averaging them down would wipe the deposit.
+      do lvl=dlvl-1,0,-1
          call A%average_downto(lvl)
+      end do
+      ! The AMR fluid advances on the composite hierarchy, so a source deposited on a
+      ! particle-coupling level must also exist in every finer valid cell.  This is a
+      ! transfer operation, not a smoothing operation: it must happen even when the
+      ! optional filter is disabled.  In particular, a capped particle level combined
+      ! with filter_width=0 previously left all levels above dlvl at zero; their fine
+      ! cells then replaced the covered coarse source in the fluid solve.
+      do lvl=dlvl+1,this%amr%clvl()
+         call A%fill_from_coarse(lvl,0.0_WP)
       end do
       ! Clean up scratch MFs
       do lvl=0,this%amr%clvl()
@@ -1739,7 +2134,7 @@ contains
       class(amrlpt), intent(inout) :: this
       type(amrdata), intent(inout) :: A
       real(WP) :: alpha,alpha_step
-      integer  :: nstep,n,nc,lvl,i,j,k
+      integer  :: nstep,n,nc,lvl,i,j,k,flvl
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
       type(amrex_multifab), dimension(:), allocatable :: Fx,Fy,Fz
@@ -1747,16 +2142,39 @@ contains
       real(WP) :: dxi,dyi,dzi
 
       ! Determine filter coefficient from finest level mesh size
-      alpha=max(this%filter_width**2-this%amr%min_meshsize(this%amr%clvl())**2,0.0_WP)/(16.0_WP*log(2.0_WP))
+      ! Choose the level to diffuse on. The explicit sub-step count is 6*alpha/dx^2 with
+      ! alpha ~ filter_width^2, i.e. ~0.54*(filter_width/dx)^2 - so taking dx at the FINEST level
+      ! makes the cost grow 4x per AMR level even though filter_width is a fixed physical length.
+      ! The deposit is meant to be smooth on that length anyway, so diffuse it on the coarsest
+      ! level that still resolves it with filter_ncell cells, then interpolate back up. On a
+      ! 6-level hierarchy with filter_width = 17.4 finest cells this goes from 163 sub-steps over
+      ! 7 levels to 10 over 5.
+      ! Start from the deposit ceiling, not clvl(): there is nothing to filter above this%maxlvl.
+      ! The particle placement cap is also the finest level carrying an original
+      ! deposit. An optional physical-width filter may choose a coarser level.
+      flvl=min(this%amr%clvl(),this%maxlvl)
+      do while (flvl.gt.0)
+         if (this%filter_width/this%amr%min_meshsize(flvl-1).lt.real(this%filter_ncell,WP)) exit
+         flvl=flvl-1
+      end do
+
+      alpha=max(this%filter_width**2-this%amr%min_meshsize(flvl)**2,0.0_WP)/(16.0_WP*log(2.0_WP))
       if (alpha.le.0.0_WP) return
 
       ! Number of explicit sub-steps for stability (dt < dx^2/6 in 3D)
-      nstep=ceiling(6.0_WP*alpha/this%amr%min_meshsize(this%amr%clvl())**2)
+      nstep=ceiling(6.0_WP*alpha/this%amr%min_meshsize(flvl)**2)
+
+      ! Bring the deposit down onto the filtering level (conservative, so nothing is lost). Starts
+      ! at the deposit ceiling: above it the field is zero, and averaging that down erases the
+      ! deposit rather than preserving it.
+      do lvl=min(this%amr%clvl(),this%maxlvl)-1,flvl,-1
+         call A%average_downto(lvl)
+      end do
       alpha_step=alpha/real(nstep,WP)
 
       ! Allocate face flux mfabs (no ghost needed for fluxes)
       allocate(Fx(0:this%amr%maxlvl),Fy(0:this%amr%maxlvl),Fz(0:this%amr%maxlvl))
-      do lvl=0,this%amr%clvl()
+      do lvl=0,flvl
          call this%amr%mfab_build(lvl,Fx(lvl),ncomp=A%ncomp,nover=0,atface=[.true., .false.,.false.]); call Fx(lvl)%setval(0.0_WP)
          call this%amr%mfab_build(lvl,Fy(lvl),ncomp=A%ncomp,nover=0,atface=[.false.,.true., .false.]); call Fy(lvl)%setval(0.0_WP)
          call this%amr%mfab_build(lvl,Fz(lvl),ncomp=A%ncomp,nover=0,atface=[.false.,.false.,.true. ]); call Fz(lvl)%setval(0.0_WP)
@@ -1765,7 +2183,7 @@ contains
       ! Explicit sub-steps
       do n=1,nstep
          ! Compute diffusive fluxes at each level
-         do lvl=0,this%amr%clvl()
+         do lvl=0,flvl
             dxi=1.0_WP/this%amr%dx(lvl)
             dyi=1.0_WP/this%amr%dy(lvl)
             dzi=1.0_WP/this%amr%dz(lvl)
@@ -1789,13 +2207,13 @@ contains
             call amrex_mfiter_destroy(mfi)
          end do
          ! Average down face fluxes for C/F conservation (finest→coarsest)
-         do lvl=this%amr%clvl(),1,-1
+         do lvl=flvl,1,-1
             call amrmfab_average_down_face(fmf=Fx(lvl),cmf=Fx(lvl-1),rr=[this%amr%rrefx(lvl-1),this%amr%rrefy(lvl-1),this%amr%rrefz(lvl-1)],cgeom=this%amr%geom(lvl-1))
             call amrmfab_average_down_face(fmf=Fy(lvl),cmf=Fy(lvl-1),rr=[this%amr%rrefx(lvl-1),this%amr%rrefy(lvl-1),this%amr%rrefz(lvl-1)],cgeom=this%amr%geom(lvl-1))
             call amrmfab_average_down_face(fmf=Fz(lvl),cmf=Fz(lvl-1),rr=[this%amr%rrefx(lvl-1),this%amr%rrefy(lvl-1),this%amr%rrefz(lvl-1)],cgeom=this%amr%geom(lvl-1))
          end do
          ! Apply divergence to update A
-         do lvl=0,this%amr%clvl()
+         do lvl=0,flvl
             dxi=1.0_WP/this%amr%dx(lvl)
             dyi=1.0_WP/this%amr%dy(lvl)
             dzi=1.0_WP/this%amr%dz(lvl)
@@ -1810,14 +2228,23 @@ contains
             end do
             call amrex_mfiter_destroy(mfi)
          end do
-         ! Restore coarse valid cells covered by fine
-         call A%average_down()
-         ! Fill ghosts at all levels
-         call A%fill(time=0.0_WP)
+         ! Restore coarse valid cells covered by fine, and fill ghosts - within 0..flvl only
+         do lvl=flvl-1,0,-1
+            call A%average_downto(lvl)
+         end do
+         do lvl=0,flvl
+            call A%fill_lvl(lvl,0.0_WP)
+         end do
+      end do
+
+      ! Push the filtered field back up. Levels above flvl are replaced by interpolation, which is
+      ! the intent - the source is not supposed to carry structure below the filter width.
+      do lvl=flvl+1,this%amr%clvl()
+         call A%fill_from_coarse(lvl,0.0_WP)
       end do
 
       ! Destroy flux mfabs
-      do lvl=0,this%amr%clvl()
+      do lvl=0,flvl
          call amrex_multifab_destroy(Fx(lvl))
          call amrex_multifab_destroy(Fy(lvl))
          call amrex_multifab_destroy(Fz(lvl))
@@ -1976,7 +2403,8 @@ contains
    !> Compute particle statistics: np, d/vel min/max/mean/var, Vp_tot, and VF field stats
    subroutine get_info(this)
       use amrex_amr_module, only: amrex_multifab,amrex_mfiter,amrex_mfiter_build,amrex_mfiter_destroy,amrex_box
-      use mpi_f08,  only: MPI_ALLREDUCE,MPI_SUM,MPI_MIN,MPI_MAX,MPI_IN_PLACE,MPI_INTEGER8,MPI_INTEGER
+      use iso_fortran_env, only: output_unit
+      use mpi_f08,  only: MPI_ALLREDUCE,MPI_BARRIER,MPI_SUM,MPI_MIN,MPI_MAX,MPI_IN_PLACE,MPI_INTEGER8,MPI_INTEGER
       use parallel, only: MPI_REAL_WP
       use mathtools, only: Pi
       implicit none
@@ -1987,7 +2415,7 @@ contains
       real(WP), dimension(:,:,:,:), pointer :: pVF
       integer(I8) :: np_
       integer :: lvl,n,i,j,k,ierr
-      real(WP) :: d_sum,d_sq,vx_sum,vx_sq,vy_sum,vy_sq,vz_sum,vz_sq,inv_np
+      real(WP) :: d_sum,d_sq,vx_sum,vx_sq,vy_sum,vy_sq,vz_sum,vz_sq,inv_np,re_loc,ma_loc,kn_loc
       ! Init per-rank accumulators
       this%np=0; this%Vp_tot=0.0_WP
       this%dmin=huge(1.0_WP); this%dmax=-huge(1.0_WP);  d_sum=0.0_WP;  d_sq=0.0_WP
@@ -2018,6 +2446,29 @@ contains
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%np,    1,MPI_INTEGER8,MPI_SUM,this%amr%comm,ierr)
       if (this%np_max.gt.0) this%np_eff=real(this%np,WP)/real(this%np_max,WP)/real(this%amr%nproc,WP)
       ! Reduce other statistics
+      re_loc=this%Remax; ma_loc=this%Mamax; kn_loc=this%Knmax
+      call MPI_ALLREDUCE(MPI_IN_PLACE,this%Remax, 1,MPI_REAL_WP ,MPI_MAX,this%amr%comm,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,this%Mamax, 1,MPI_REAL_WP ,MPI_MAX,this%amr%comm,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,this%Knmax, 1,MPI_REAL_WP ,MPI_MAX,this%amr%comm,ierr)
+      ! Re/Ma/Kn maxima are independent. When requested, print the full co-located state behind
+      ! each global maximum so a monitor value can be reconstructed without ambiguity.
+      if (this%drag_diagnostic_pending) then
+         if (max(this%Remax,this%Mamax,this%Knmax).gt.0.0_WP) then
+            if (this%amr%amRoot) write(output_unit,'(a)') &
+            &  'AMRLPT_DRAG_EXTREME columns: kind rank t_lpt step_dt particle_dt_done particle_mydt level x y z vp_x vp_y vp_z ug_x ug_y ug_z slip_x slip_y slip_z slip_mag d rho_g mu c pVF fVF Re Ma Kn gamma corr tau'
+            call MPI_BARRIER(this%amr%comm,ierr)
+            do i=0,this%amr%nproc-1
+               if (this%amr%rank.eq.i) then
+                  if (re_loc.eq.this%Remax) write(output_unit,'("AMRLPT_DRAG_EXTREME ReMax ",i0,1x,*(es24.16e3,1x))') this%amr%rank,this%drag_diagnostic_record(:,1)
+                  if (ma_loc.eq.this%Mamax) write(output_unit,'("AMRLPT_DRAG_EXTREME MaMax ",i0,1x,*(es24.16e3,1x))') this%amr%rank,this%drag_diagnostic_record(:,2)
+                  if (kn_loc.eq.this%Knmax) write(output_unit,'("AMRLPT_DRAG_EXTREME KnMax ",i0,1x,*(es24.16e3,1x))') this%amr%rank,this%drag_diagnostic_record(:,3)
+                  flush(output_unit)
+               end if
+               call MPI_BARRIER(this%amr%comm,ierr)
+            end do
+         end if
+         this%drag_diagnostic_pending=.false.
+      end if
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%Vp_tot,1,MPI_REAL_WP ,MPI_SUM,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%dmin,  1,MPI_REAL_WP ,MPI_MIN,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%dmax,  1,MPI_REAL_WP ,MPI_MAX,this%amr%comm,ierr)
@@ -2043,6 +2494,24 @@ contains
          this%Vmean=vy_sum*inv_np; this%Vvar=max(0.0_WP,vy_sq*inv_np-this%Vmean**2)
          this%Wmean=vz_sum*inv_np; this%Wvar=max(0.0_WP,vz_sq*inv_np-this%Wmean**2)
       end if
+      ! Record actual occupied levels and make a violation of maxlvl directly
+      ! observable to validation cases and production monitors.
+      particle_level_stats: block
+         integer(I8), dimension(:), allocatable :: counts
+         allocate(counts(0:this%amr%clvl()))
+         call this%get_level_counts(counts)
+         this%occupied_minlvl=-1; this%occupied_maxlvl=-1
+         do lvl=0,this%amr%clvl()
+            if (counts(lvl).gt.0_I8) then
+               if (this%occupied_minlvl.lt.0) this%occupied_minlvl=lvl
+               this%occupied_maxlvl=lvl
+            end if
+         end do
+         this%np_above_maxlvl=0_I8
+         if (this%maxlvl.lt.this%amr%clvl()) &
+         &   this%np_above_maxlvl=sum(counts(this%maxlvl+1:this%amr%clvl()))
+         deallocate(counts)
+      end block particle_level_stats
       ! Volume fraction statistics
       vf_stats_block: block
          use amrex_amr_module, only: amrex_imultifab,amrex_imultifab_build,amrex_imultifab_destroy
@@ -2133,6 +2602,8 @@ contains
       call log(trim(message))
       write(message,'("  Drag model        : ",a)') trim(this%drag_model)
       call log(trim(message))
+      write(message,'("  Gas gamma         : ",ES12.5)') this%gas_gamma
+      call log(trim(message))
       write(message,'("  ODE substeps      : ",i0)') this%nstep
       call log(trim(message))
       call log('  Grid: '//trim(this%amr%name))
@@ -2165,8 +2636,7 @@ contains
          call this%set_particle_dm(lvl,this%amr%get_distromap(lvl))
       end do
       call amrlpt_read(this%pc,trim(dirname)//'/particles'//c_null_char)
-      call amrlpt_redistribute(this%pc,0,this%maxlvl,0)
-      call amrlpt_total_np(this%pc,this%np)
+      call this%enforce_max_level()
       call this%update_VF()
    end subroutine read
 
