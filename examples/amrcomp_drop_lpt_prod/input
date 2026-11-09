@@ -97,24 +97,7 @@ Restart from:      !restart/drop_6.00000E+00
 #
 # Detached non-core components wholly on the finest level can transfer at any distance
 # from the core, when their equivalent-volume diameter is at most the configured maximum.
-# Refill requires component donor cells with at least 50% gas; no donors means no removal.
-#
-# COUPLING returns momentum and total energy to the fluid. The mechanical part of src(4)
-# is minus the hydrodynamic impulse dotted with the particle endpoint-average velocity;
-# the thermal part is minus the accepted particle internal-energy change. Mechanical work
-# includes resolved stress. Drag dissipation is monitored separately and is not added twice.
-# Converted particles carry the removed mass and total energy (translation plus internal
-# energy). Gunn particle heat exchange is enabled, using the liquid EOS and k_g=mu_g*cp_g/Pr.
-# Gunn porosity is fixed at 1; Eulerian gas fraction still weights sampled gas properties.
-# The existing midpoint push limits thermal substeps to half the local thermal response time.
-# There is no evaporation/phase-change model. Particle mass and diameter stay fixed after birth.
-# Gas sampling retains every positive usable gas fraction, normalized over the stencil.
-# A gas-free stencil culls the last accepted particle state; separate loss ledgers
-# book mass, momentum and total energy. No liquid-drag fallback or reabsorption.
-#
-# Additional source diffusion defaults to zero; trilinear deposition spreads the reaction
-# over the coupling stencil. Diameter ratio alone does not establish dilute local loading.
-# ---------------------------------------------------------------------
+# Full two-way coupling attempt
 Drop transfer:              .true.
 Drop transfer maximum diameter ratio: 1.0
 # Minimum diameter / finest-grid spacing (formerly coupling-grid units).
@@ -125,18 +108,14 @@ Drop transfer nsteps:       10
 !Drop transfer margin:      0.5
 
 # Spray solver
-# Osnes et al. (2023) is the only drag law in amrlpt that is in range at the Re_p these drops
-# see; Schiller-Naumann under-predicts drag by ~10x. Watch 'Re max'/'Ma max'/'Kn max' in
-# monitor/spray to confirm the model is being used inside its intended range.
+# Osnes et al. (2023) drag model used. 
 # Drag samples molecular gas viscosity and gas sound speed, not effective mixture
-# viscosity/sound speed. Gas-property interpolation is normalized by gas fraction;
-# pure-liquid cells have zero weight, and a gas-free particle stencil is an error.
+# viscosity/sound speed. 
 # Levels below 'Max level' that particles are capped to. The cap coarsens BOTH fluid
 # sampling and source deposition; the reaction is transferred to finer fluid levels.
 # The maximum transfer diameter is 'Drop transfer maximum diameter ratio' times
 # the minimum spacing at the particle level cap. The default ratio is 1.0.
 # The initialization check rejects a transfer threshold that exceeds 'Particle maximum d/dx'.
-# Watch 'd/dx couple' in monitor/spray to confirm the configured upper bound.
 Particle level offset: 2
 Particle maximum d/dx: 1.0
 
@@ -149,34 +128,7 @@ Particle collisions:  .false.
 !Spray output period: 1e-1
 
 # ---------------------------------------------------------------------
-# Wake coarsening (off by default; the settings below are a suggested starting point)
-#
-# Of the four tagging criteria only the SGS cell-Reynolds test is a turbulence-RESOLUTION test,
-# and in a turbulent wake it never switches off - which is what keeps the wake refined far
-# downstream. These knobs make that one criterion progressively harder to satisfy with level and
-# with downstream distance, only inside the wake. With 'Wake tag density' enabled, the density
-# Laplacian shares the ramp and cap. Liquid pressure and Ducros criteria are not wake-ramped.
-# The density indicator is bounded by 1: a ramped threshold >= 1 disables that criterion.
-#
-#   Re_eff = Re_tag * (Wake tag ramp)^(lvl - Wake tag level)     for lvl above the level
-#                   * 2^((x - x_start)/Wake tag length)          for x beyond x_start
-#
-# Both multipliers apply only for x > x_start; upstream the original thresholds are retained.
-# Here x_start = max(Wake tag x0, downstream face of the padded core box).
-# This protects the primary-drop region from wake coarsening. The box does not restrict
-# transfer: eligible detached structures can transfer at any distance from the core.
-#
-# 'Wake max level offset' is a true relative cap on refinement requested by the SGS-Re criterion
-# and, when 'Wake tag density' is true, by the density criterion inside the wake.  Other criteria
-# remain free to refine shocks and Eulerian liquid interfaces to Max level.  With Max level=6 and
-# offset=2, wake criteria can request grids through level 4 but cannot request levels 5 or 6.
-# AMReX grid clustering/proper nesting can still extend a fine box a short distance into the wake,
-# and independent shock/interface criteria are deliberately unaffected.
-#
-# Suggested: allow full turbulence refinement to level 2, then quadruple the threshold per level
-# while also imposing the explicit two-level wake cap, and double the threshold again every
-# 2 length units past x=1.
-# ---------------------------------------------------------------------
+# Wake coarsening: to reduce excessive refinement in the far wake
 Wake tag level:  2
 Wake tag ramp:   4.0
 Wake max level offset: 2
