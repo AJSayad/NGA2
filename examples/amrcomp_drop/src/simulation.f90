@@ -667,7 +667,11 @@ contains
          ! Provide pressure relaxation model
          call relax_model%initialize(gas=gas,liq=water); fs%relax=>relax_model
          relax_model%model=Prelax
-         relax_model%RHOGmin=0.0_WP
+         ! Refuse relaxations that leave the gas below 1e-2 (torrens); the model's own RHOGmin keeps its 1e-2 default
+         fs%rhoG_min=1.0e-2_WP
+         ! Positivity gate temperature floors (0: undeclared, a pure cell outside its law's domain stops the run)
+         call param_read('Liquid Tmin',fs%TminL,default=0.0_WP)
+         call param_read('Gas Tmin'   ,fs%TminG,default=0.0_WP)
          ! Set initial conditions
          fs%user_init=>shockdrop_init
          ! Set BCs
@@ -897,6 +901,7 @@ contains
          call rescfile%add_column(fs%nvf_guard,'VF guard cells')
          call rescfile%add_column(fs%nsliver,'Sliver cells')
          call rescfile%add_column(fs%ngate,'Gate cells')
+         call rescfile%add_column(fs%ngate_floor,'Gate floors')
          call rescfile%add_column(fs%gate_mass,'Gate mass')
          call rescfile%add_column(fs%gate_energy,'Gate energy')
          call rescfile%add_column(fs%gate_rhoU,'Gate U momentum')

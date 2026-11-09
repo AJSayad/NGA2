@@ -15,7 +15,7 @@ module simulation
    use relax_ig_nasg_class, only: relax_ig_nasg, Prelax !, PThybrid
    ! use safe_relax_class,    only: safe_relax
    use amrccl_class,        only: amrccl
-   use amrlpt_class,        only: amrlpt,part,PART_MOVES,PART_COLLIDES,PART_EXCHANGES,AMRLPT_OPEN
+   use amrlpt_class,        only: amrlpt,part,particle_finite,PART_MOVES,PART_COLLIDES,PART_EXCHANGES,AMRLPT_OPEN
    use amrlptviz_class,     only: amrlptviz
    use timer_class,         only: timer
    implicit none
@@ -43,6 +43,7 @@ module simulation
    type(event) :: save_evt
    character(len=str_medium) :: restart_dir
    logical :: restarted
+   integer :: restart_step=0
    real(WP) :: restart_time
 
    !> Simulation monitoring
@@ -70,7 +71,9 @@ module simulation
 
    !> Sub-grid drop transfer: connected-component labelling hands unresolved liquid structures to a Lagrangian spray
    type(amrccl), target :: ccl
+   type(amrdata)   :: spray_energy,spray_force(3),spray_cells !< Frozen cell energy / face momentum rates
    type(amrdata)   :: particle_stress    !< Resolved effective stress divergence, force/volume
+   type(amrdata)   :: particle_thermal  !< Gas temperature and molecular conductivity
    type(amrdata)   :: particle_gas      !< Molecular gas viscosity and gas sound speed
    type(amrdata)   :: particle_gas_fraction !< Valid gas fraction for normalized interpolation
    type(amrlpt)    :: lp
@@ -78,20 +81,18 @@ module simulation
    type(event)     :: lpviz_evt,xfer_evt
    type(monitor)   :: sprayfile
    logical  :: do_transfer=.false.        !< Master switch, off by default
-   real(WP) :: xfer_volcoeff=24.0_WP      !< Transfer structures no larger than this many cells
-   real(WP) :: xfer_diam_threshold=1.0e-1_WP !< Minimum particle diameter in particle-grid cells
-   real(WP) :: xfer_margin=-1.0_WP        !< Clearance around the core box; <0 means 0.5*d_drop
+   real(WP) :: xfer_dmax_ratio=1.0_WP     !< Maximum equivalent diameter / coupling-cap spacing
+   real(WP) :: xfer_diam_threshold=1.0e-1_WP !< Minimum particle diameter / finest-grid spacing
+   real(WP) :: xfer_margin=-1.0_WP        !< Core-box padding for wake tagging only; <0 means 0.5*d_drop
    real(WP) :: xfer_dmax=0.0_WP           !< Equal-volume diameter of the largest transferable drop
    real(WP) :: lp_dx=0.0_WP               !< Cell size on the finest allowed particle level
    real(WP) :: lp_dres=0.0_WP             !< xfer_dmax/lp_dx - drop diameter in coupling-mesh cells.
    real(WP) :: lp_dres_limit=1.0_WP       !< Largest permitted particle diameter / particle-cell size
-   !< This is the number the level cap exists to control: With volume coeff 24: ~3.58 uncapped, ~0.447 at offset 3
    real(WP), dimension(3) :: corelo=0.0_WP,corehi=0.0_WP  !< Core bounding box, reported to the monitor
    integer  :: lp_lvl_off=3               !< Levels below amr%maxlvl that particles are capped to
-   integer  :: lp_maxlvl_r=0              !< Mirror of lp%maxlvl for the monitor
    logical  :: lp_collide=.false.         !< Soft-sphere collisions between transferred drops
    !> Number of per-structure moments used by label_and_moments
-   integer, parameter :: NMOM=21
+   integer, parameter :: NMOM=24 !< Last three: donor gas volume, mass, internal energy
    integer :: core_id=0                  !< Largest liquid-volume label
    real(WP), dimension(NMOM) :: core_mom=0.0_WP
    !> Windward face x of the primary drop: any liquid, then VF>=0.01/0.1/0.5
@@ -104,7 +105,8 @@ module simulation
    real(WP)    :: dt_src=1.0_WP     !< Interval lp%src was accumulated over (measured, not assumed)
    !> Candidate census of the last labelling (see label_and_moments)
    integer  :: xfer_ncand=0
-   real(WP), dimension(3) :: xfer_rej=0.0_WP,xfer_fin=0.0_WP
+   real(WP), dimension(2) :: xfer_rej=0.0_WP
+   real(WP), dimension(4) :: xfer_fin=0.0_WP !< Size, coarse, no-donor, and invalid-birth rejections
    real(WP) :: core_fallbacks=0.0_WP      !< Labellings whose core could not be certified from the top-K sets
    !> Per-step coupling tracker
    real(WP)    :: src_momx=0.0_WP,src_ener=0.0_WP,src_emin=0.0_WP
@@ -121,13 +123,19 @@ module simulation
    real(WP)    :: t_xfer=0.0_WP,t_ccl=0.0_WP,t_msweep=0.0_WP,t_mcomm=0.0_WP,t_xpart=0.0_WP,t_surg=0.0_WP,t_resync=0.0_WP
    real(WP)    :: t_diag=0.0_WP,t_regrid=0.0_WP,t_props=0.0_WP,t_sgs=0.0_WP,t_viz=0.0_WP,t_ckpt=0.0_WP,t_mon=0.0_WP
    real(WP)    :: t_other=0.0_WP
-   real(WP)    :: xfer_vol=0.0_WP,xfer_mass=0.0_WP,xfer_momx=0.0_WP,xfer_energy=0.0_WP
+   real(WP)    :: xfer_vol=0.0_WP,xfer_mass=0.0_WP,xfer_momx=0.0_WP,xfer_momy=0.0_WP,xfer_momz=0.0_WP,xfer_energy=0.0_WP
    !> Cumulative numerical liquid discarded by the minimum particle-diameter threshold
    real(WP)    :: flot_n_total=0.0_WP,flot_vol=0.0_WP,flot_mass=0.0_WP
+   real(WP) :: flot_mom(3)=0.0_WP,flot_energy=0.0_WP
    !> Gas mass the surgery adds when filling vacated volume
    real(WP)    :: xfer_gasadd=0.0_WP
+   !> Numerical refill residual: mesh change plus removed liquid momentum/energy (including flotsam)
+   real(WP), dimension(4) :: xfer_refill=0.0_WP
+   real(WP) :: xfer_refused=0.0_WP,xfer_badthermal=0.0_WP
+   !> Cumulative change made by regrids: liquid mass, gas mass, momentum, total energy
+   real(WP), dimension(6) :: regrid_book=0.0_WP
    !> Per-FAB pointers rebound by ccl_prepare and read by ccl_make / ccl_same
-   real(WP), dimension(:,:,:,:), contiguous, pointer :: cVF=>null(),cPLIC=>null()
+   real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF=>null(),pPLIC=>null()
    real(WP) :: cdx,cdy,cdz                !< Mesh size at the labeled level
 
    !> Materials
@@ -252,7 +260,7 @@ contains
                      pVisc(i,j,k,1)=1.0_WP/(pVF(i,j,k,1)/max(mu_l,myeps)+(1.0_WP-pVF(i,j,k,1))/max(mu_g,myeps)) ! Harmonic averaging
                      ! Zero bulk viscosity
                      pBeta(i,j,k,1)=0.0_WP
-                     ! Run with no heat transfer: diffL/diffG stay at the zero the solver sets on every level
+                     ! Resolved-fluid conduction remains off: diffL/diffG stay zero; particle heat is separate
                   end do; end do; end do
          end do
          call amr%mfiter_destroy(mfi)
@@ -265,13 +273,11 @@ contains
    subroutine get_particle_gas_properties()
       use amrex_amr_module, only: amrex_mfiter,amrex_box
       use messager, only: die
-      use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
       implicit none
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOG,pPG,pGas,pFraction
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOG,pPG,pGas,pFraction,pTherm
       real(WP) :: Tgas,Tmu
-      real(WP), parameter :: VF_gas_max=0.99_WP   ! under 1% gas the phasic state is meaningless
       integer :: lvl,i,j,k
       do lvl=0,min(lp%maxlvl,amr%clvl())
          call amr%mfiter_build(lvl,mfi,tiling=.false.)
@@ -280,21 +286,26 @@ contains
             pRHOG=>fs%RHOG%mf(lvl)%dataptr(mfi)
             pPG=>fs%PG%mf(lvl)%dataptr(mfi)
             pGas=>particle_gas%mf(lvl)%dataptr(mfi)
+            pTherm=>particle_thermal%mf(lvl)%dataptr(mfi)
             pFraction=>particle_gas_fraction%mf(lvl)%dataptr(mfi)
             bx=mfi%growntilebox(lp%nover)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               pGas(i,j,k,:)=0.0_WP; pFraction(i,j,k,1)=0.0_WP
-               if (pVF(i,j,k,1).gt.VF_gas_max) cycle
-               if (.not.ieee_is_finite(pRHOG(i,j,k,1)).or..not.ieee_is_finite(pPG(i,j,k,1))) &
+               pGas(i,j,k,:)=0.0_WP; pFraction(i,j,k,1)=0.0_WP; pTherm(i,j,k,:)=0.0_WP
+               if (.not.particle_finite(pVF(i,j,k,1))) call die('[particle gas properties] non-finite liquid fraction')
+               if (pVF(i,j,k,1).ge.1.0_WP) cycle
+               if (.not.particle_finite(pRHOG(i,j,k,1)).or..not.particle_finite(pPG(i,j,k,1))) &
                & call die('[particle gas properties] non-finite gas density or pressure')
                ! The solver treats the gas as absent where its mass or internal energy is not positive
                if (pRHOG(i,j,k,1).le.0.0_WP.or.pPG(i,j,k,1).le.0.0_WP) cycle
                Tgas=gas%get_T_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP])
-               if (.not.ieee_is_finite(Tgas).or.Tgas.le.0.0_WP) &
+               if (.not.particle_finite(Tgas).or.Tgas.le.0.0_WP) &
                & call die('[particle gas properties] invalid gas temperature')
                Tmu=min(Tgas,10.0_WP) ! Same molecular-viscosity cap as get_viscosities
                pGas(i,j,k,1)=(1.0_WP+Suth_T)*Tmu**Suth_n/(Reynolds*(Tmu+Suth_T))
                pGas(i,j,k,2)=sqrt(gas%gamma*(gas%gamma-1.0_WP)*gas%cv*Tgas)
+               pTherm(i,j,k,1)=Tgas
+               ! Nondimensional k: mu*cp/Pr, with cp in the same energy/temperature units as the EOS.
+               pTherm(i,j,k,2)=pGas(i,j,k,1)*gas%cp/Prandtl
                pFraction(i,j,k,1)=max(0.0_WP,1.0_WP-pVF(i,j,k,1))
             end do; end do; end do
          end do
@@ -314,7 +325,7 @@ contains
       type(amrex_multifab), dimension(0:amr%maxlvl) :: Fx,Fy,Fz
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx,gbx,fbx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pFx,pFy,pFz,pU,pV,pW,pP,pVisc,pBeta,rhs
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pFx,pFy,pFz,pU,pV,pW,pP,pVisc,pBeta,pRHS
       real(WP), dimension(:,:,:,:), allocatable :: uc
       real(WP), dimension(1:3,1:3) :: dUdx
       real(WP) :: dxi,dyi,dzi,div,visc_f,beta_f
@@ -449,11 +460,11 @@ contains
          dzi=1.0_WP/amr%dz(lvl); if (amr%nz.eq.1) dzi=0.0_WP
          call amr%mfiter_build(lvl,mfi,tiling=.false.)
          do while (mfi%next())
-            rhs=>stress_div%mf(lvl)%dataptr(mfi)
+            pRHS=>stress_div%mf(lvl)%dataptr(mfi)
             pFx=>Fx(lvl)%dataptr(mfi); pFy=>Fy(lvl)%dataptr(mfi); pFz=>Fz(lvl)%dataptr(mfi)
             bx=mfi%tilebox()
             do n=1,3; do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               rhs(i,j,k,n)=dxi*(pFx(i+1,j,k,n)-pFx(i,j,k,n)) &
+               pRHS(i,j,k,n)=dxi*(pFx(i+1,j,k,n)-pFx(i,j,k,n)) &
                &          +dyi*(pFy(i,j+1,k,n)-pFy(i,j,k,n)) &
                &          +dzi*(pFz(i,j,k+1,n)-pFz(i,j,k,n))
             end do; end do; end do; end do
@@ -492,7 +503,7 @@ contains
       real(WP), intent(in) :: dt,t
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pRHOU,pRHOV,pRHOW
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pRhoU,pRhoV,pRhoW
       real(WP) :: dx,dy,dz,fac,rho,p,u
       real(WP), parameter :: VF_spg=1.0e-6_WP ! Below this VF a cell is treated as pure gas
       ! Nothing to do if the sponge is off
@@ -505,9 +516,9 @@ contains
          do while (mfi%next())
             ! Get pointers to data
             pQ=>fs%Q%mf(lvl)%dataptr(mfi)
-            pRHOU=>fs%rhoU%mf(lvl)%dataptr(mfi)
-            pRHOV=>fs%rhoV%mf(lvl)%dataptr(mfi)
-            pRHOW=>fs%rhoW%mf(lvl)%dataptr(mfi)
+            pRhoU=>fs%rhoU%mf(lvl)%dataptr(mfi)
+            pRhoV=>fs%rhoV%mf(lvl)%dataptr(mfi)
+            pRhoW=>fs%rhoW%mf(lvl)%dataptr(mfi)
             ! Cells: relax the gas conserved variables toward the undisturbed state
             bx=mfi%tilebox()
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
@@ -529,21 +540,21 @@ contains
                      if (max(pQ(i-1,j,k,1),pQ(i,j,k,1)).gt.VF_spg*rhoL1) cycle
                      ! Undisturbed state at the x-face
                      call freestream_state(x_cc=amr%xlo+real(i,WP)*dx,t=t,dx=dx,rho=rho,p=p,u=u)
-                     pRHOU(i,j,k,1)=pRHOU(i,j,k,1)+fac*(rho*u-pRHOU(i,j,k,1))
+                     pRhoU(i,j,k,1)=pRhoU(i,j,k,1)+fac*(rho*u-pRhoU(i,j,k,1))
                   end do; end do; end do
             bx=mfi%nodaltilebox(2)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                      fac=sponge_factor(y=amr%ylo+real(j,WP)*dy,z=amr%zlo+(real(k,WP)+0.5_WP)*dz)
                      if (fac.le.0.0_WP) cycle
                      if (max(pQ(i,j-1,k,1),pQ(i,j,k,1)).gt.VF_spg*rhoL1) cycle
-                     pRHOV(i,j,k,1)=pRHOV(i,j,k,1)-fac*pRHOV(i,j,k,1)
+                     pRhoV(i,j,k,1)=pRhoV(i,j,k,1)-fac*pRhoV(i,j,k,1)
                   end do; end do; end do
             bx=mfi%nodaltilebox(3)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                      fac=sponge_factor(y=amr%ylo+(real(j,WP)+0.5_WP)*dy,z=amr%zlo+real(k,WP)*dz)
                      if (fac.le.0.0_WP) cycle
                      if (max(pQ(i,j,k-1,1),pQ(i,j,k,1)).gt.VF_spg*rhoL1) cycle
-                     pRHOW(i,j,k,1)=pRHOW(i,j,k,1)-fac*pRHOW(i,j,k,1)
+                     pRhoW(i,j,k,1)=pRhoW(i,j,k,1)-fac*pRhoW(i,j,k,1)
                   end do; end do; end do
          end do
          call amr%mfiter_destroy(mfi)
@@ -751,7 +762,7 @@ contains
       dy=solver%amr%dy(lvl); dyi=1.0_WP/dy; dyi2=1.0_WP/dy**2
       dz=solver%amr%dz(lvl); dzi=1.0_WP/dz; dzi2=1.0_WP/dz**2
       delta=solver%amr%min_meshsize(lvl); delta2=delta**2
-      ! Never begin coarsening upstream of the transfer boundary
+      ! Begin wake coarsening downstream of the padded core box
       wake_xstart=wake_x0
       if (do_transfer.and.corehi(1).gt.corelo(1)) then
          if (wake_x0.ge.0.5_WP*huge(1.0_WP)) then
@@ -864,10 +875,10 @@ contains
       implicit none
       integer, intent(in) :: lvl
       type(amrex_mfiter), intent(inout) :: mfi
-      cVF  =>fs%VF%mf(lvl)%dataptr(mfi)
+      pVF  =>fs%VF%mf(lvl)%dataptr(mfi)
       cdx=amr%dx(lvl); cdy=amr%dy(lvl); cdz=amr%dz(lvl)
-      nullify(cPLIC)
-      if (lvl.eq.amr%maxlvl) cPLIC=>fs%PLIC%dataptr(mfi)
+      nullify(pPLIC)
+      if (lvl.eq.amr%maxlvl) pPLIC=>fs%PLIC%dataptr(mfi)
    end subroutine ccl_prepare
 
    !> A cell belongs to a structure if it holds any liquid
@@ -875,7 +886,7 @@ contains
       use amrmpcomp_class, only: VFlo
       implicit none
       integer, intent(in) :: i1,j1,k1
-      ccl_make=(cVF(i1,j1,k1,1).gt.VFlo)
+      ccl_make=(pVF(i1,j1,k1,1).gt.VFlo)
    end function ccl_make
 
    !> Thin-film split test after shock_droplet: opposed interfaces that face each other get different labels
@@ -886,23 +897,44 @@ contains
       ! Big default, assume same label
       ccl_same=.true.
       ! PLIC exists only at maxlvl, so coarser liquid uses face connectivity
-      if (.not.associated(cPLIC)) return
+      if (.not.associated(pPLIC)) return
       ! Both cells must carry a real interface
-      if (abs(cPLIC(i1,j1,k1,4)).gt.1.0e9_WP) return
-      if (abs(cPLIC(i2,j2,k2,4)).gt.1.0e9_WP) return
-      N1=cPLIC(i1,j1,k1,1:3)
-      N2=cPLIC(i2,j2,k2,1:3)
+      if (abs(pPLIC(i1,j1,k1,4)).gt.1.0e9_WP) return
+      if (abs(pPLIC(i2,j2,k2,4)).gt.1.0e9_WP) return
+      N1=pPLIC(i1,j1,k1,1:3)
+      N2=pPLIC(i2,j2,k2,1:3)
       ! If not at least ~72 degrees apart, return
       if (dot_product(N1,N2).ge.0.3_WP) return
       ! Foot of the perpendicular from each cell center onto its own plane
       X1=[amr%xlo+(real(i1,WP)+0.5_WP)*cdx,amr%ylo+(real(j1,WP)+0.5_WP)*cdy,amr%zlo+(real(k1,WP)+0.5_WP)*cdz]
       X2=[amr%xlo+(real(i2,WP)+0.5_WP)*cdx,amr%ylo+(real(j2,WP)+0.5_WP)*cdy,amr%zlo+(real(k2,WP)+0.5_WP)*cdz]
-      O1=X1-(dot_product(N1,X1)-cPLIC(i1,j1,k1,4))*N1
-      O2=X2-(dot_product(N2,X2)-cPLIC(i2,j2,k2,4))*N2
+      O1=X1-(dot_product(N1,X1)-pPLIC(i1,j1,k1,4))*N1
+      O2=X2-(dot_product(N2,X2)-pPLIC(i2,j2,k2,4))*N2
       ! If pointing towards one another, use different labels
       if (dot_product(O1-O2,N1).lt.0.0_WP.and.dot_product(O2-O1,N2).lt.0.0_WP) ccl_same=.false.
    end function ccl_same
 
+
+   !> Mixture kinetic energy of a cell, a copy of amrmpcomp_class's private cell_ke (keep identical)
+   pure real(WP) function cell_ke(pQ,pU,pV,pW,i,j,k,rho_floor) result(ke)
+      implicit none
+      real(WP), dimension(:,:,:,:), contiguous, pointer, intent(in) :: pQ,pU,pV,pW
+      integer, intent(in) :: i,j,k
+      real(WP), intent(in) :: rho_floor
+      ke=0.25_WP*(max(0.5_WP*sum(pQ(i-1:i,j,k,1:2)),rho_floor)*pU(i,j,k,1)**2+max(0.5_WP*sum(pQ(i:i+1,j,k,1:2)),rho_floor)*pU(i+1,j,k,1)**2 &
+      &          +max(0.5_WP*sum(pQ(i,j-1:j,k,1:2)),rho_floor)*pV(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j:j+1,k,1:2)),rho_floor)*pV(i,j+1,k,1)**2 &
+      &          +max(0.5_WP*sum(pQ(i,j,k-1:k,1:2)),rho_floor)*pW(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j,k:k+1,1:2)),rho_floor)*pW(i,j,k+1,1)**2)
+   end function cell_ke
+
+   !> Maximum liquid volume admitted by the equivalent-sphere diameter limit.
+   real(WP) function transfer_volume_limit() result(vmax)
+      use mathtools, only: Pi
+      vmax=Pi/6.0_WP*xfer_dmax**3
+   end function transfer_volume_limit
+
+   real(WP) function transfer_min_diameter() result(dmin)
+      dmin=xfer_diam_threshold*amr%min_meshsize(amr%maxlvl)
+   end function transfer_min_diameter
 
    !> Label the liquid and reduce the moments of the transfer candidates and the core; call before any regrid
    subroutine label_and_moments(cid,mom,cmap,ns)
@@ -919,7 +951,7 @@ contains
       integer, parameter :: KTOP=4
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pId,pVF,pQ,pUVW,pCL
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pId,pVF,pQ,pUVW,pCL,pU,pV,pW
       ! Rank-local table: slot(label) -> local slot, sid(slot) -> label
       integer,  dimension(:),   allocatable :: slot,sid
       real(WP), dimension(:,:), allocatable :: lmom,lbox,lle
@@ -931,12 +963,11 @@ contains
       integer,  dimension(:), allocatable :: alltop,tid,nom,allnom,counts,displs
       real(WP), dimension(:), allocatable :: tbuf,vall
       real(WP), dimension(7) :: minbuf
-      real(WP), dimension(3) :: rejbuf
+      real(WP), dimension(2) :: rejbuf
       real(WP), dimension(3) :: L,Olo,X,cell_second
-      real(WP) :: vol,theta,mi,xface,boxmargin,volmax,v
-      integer, dimension(3) :: ncell
+      real(WP) :: vol,theta,mi,xface,boxmargin,volmax,v,ag,ig
+      real(WP), dimension(2) :: masses
       integer :: lvl,i,j,k,n,d,s,m,p,nT,nnom,ntot,nU,ierr
-      logical :: outside
 
       ! Coarse liquid is included even when the hierarchy has not yet reached maxlvl.
       core_mom=0.0_WP; core_mle=+huge(1.0_WP); core_mom_valid=.false.; core_id=0
@@ -967,6 +998,7 @@ contains
             pVF =>fs%VF%mf(lvl)%dataptr(mfi)
             pQ  =>fs%Q%mf(lvl)%dataptr(mfi)
             pUVW=>fs%UVW%mf(lvl)%dataptr(mfi)
+            pU=>fs%U%mf(lvl)%dataptr(mfi); pV=>fs%V%mf(lvl)%dataptr(mfi); pW=>fs%W%mf(lvl)%dataptr(mfi)
             if (lvl.eq.amr%maxlvl) pCL =>fs%CL%dataptr(mfi)
             bx=mfi%validbox()
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
@@ -997,6 +1029,14 @@ contains
                      lmom(19,s)=lmom(19,s)+mi*X(1)*X(2)
                      lmom(20,s)=lmom(20,s)+mi*X(1)*X(3)
                      lmom(21,s)=lmom(21,s)+mi*X(2)*X(3)
+                     ! Donor mean: gas-volume-weighted density and internal-energy density.
+                     ! Use exactly the same staggered kinetic-energy subtraction
+                     ag=1.0_WP-pVF(i,j,k,1)
+                     if (ag.ge.0.5_WP.and.pQ(i,j,k,2).gt.0.0_WP) then
+                        masses=max(pQ(i,j,k,1:2),0.0_WP)
+                        ig=pQ(i,j,k,4)-masses(2)/max(sum(masses),fs%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,fs%rho_floor)
+                        if (ig.gt.0.0_WP) lmom(22:24,s)=lmom(22:24,s)+vol*[ag,pQ(i,j,k,2),ig]
+                     end if
                      lbox(1:3,s)=min(lbox(1:3,s),[amr%xlo+real(i  ,WP)*cdx,amr%ylo+real(j  ,WP)*cdy,amr%zlo+real(k  ,WP)*cdz])
                      lbox(4:6,s)=max(lbox(4:6,s),[amr%xlo+real(i+1,WP)*cdx,amr%ylo+real(j+1,WP)*cdy,amr%zlo+real(k+1,WP)*cdz])
                      ! The leading edge is the windward cell face
@@ -1081,13 +1121,12 @@ contains
       call MPI_ALLREDUCE(MPI_IN_PLACE,minbuf,7,MPI_REAL_WP,MPI_MIN,amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,corehi,3,MPI_REAL_WP,MPI_MAX,amr%comm,ierr)
       corelo=minbuf(1:3); core_mle=minbuf(4:7)
-      ! Grow the core box by the transfer margin, so the tagger and the transfer see the same boundary
+      ! Preserve the padded core box for wake tagging; it no longer restricts transfer
       boxmargin=xfer_margin; if (boxmargin.lt.0.0_WP) boxmargin=0.5_WP*d_drop
       corelo=corelo-boxmargin; corehi=corehi+boxmargin
 
-      ! 3) Local nomination, ignoring directions resolved by a single cell
-      volmax=xfer_volcoeff*amr%cell_vol(amr%maxlvl)
-      ncell=[amr%nx,amr%ny,amr%nz]
+      ! 3) Local nomination: a local volume is a lower bound on the component volume
+      volmax=transfer_volume_limit()
       rejbuf=0.0_WP
       allocate(nom(max(nloc,1))); nnom=0
       do s=1,nloc
@@ -1098,14 +1137,6 @@ contains
          end if
          if (lmom(1,s).gt.volmax) then
             rejbuf(2)=rejbuf(2)+1.0_WP; cycle
-         end if
-         outside=.false.
-         do d=1,3
-            if (ncell(d).le.1) cycle
-            if (lbox(d,s).lt.corelo(d).or.lbox(3+d,s).gt.corehi(d)) outside=.true.
-         end do
-         if (.not.outside) then
-            rejbuf(3)=rejbuf(3)+1.0_WP; cycle
          end if
          nnom=nnom+1; nom(nnom)=n
       end do
@@ -1141,7 +1172,7 @@ contains
          if (s.gt.0) mom(:,m)=lmom(:,s)
       end do
       call MPI_ALLREDUCE(MPI_IN_PLACE,mom,NMOM*nU,MPI_REAL_WP,MPI_SUM,amr%comm,ierr)
-      call MPI_ALLREDUCE(MPI_IN_PLACE,rejbuf,3,MPI_REAL_WP,MPI_SUM,amr%comm,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,rejbuf,2,MPI_REAL_WP,MPI_SUM,amr%comm,ierr)
       call tmr_mcomm%stop()
       xfer_ncand=nU; xfer_rej=rejbuf
 
@@ -1180,30 +1211,45 @@ contains
 
    end subroutine label_and_moments
 
+   !> Validate the new particle against the liquid EOS before changing mesh or particle state.
+   logical function particle_birth_state(mass,volume,momentum,energy,eint) result(valid)
+      real(WP), intent(in) :: mass,volume,momentum(3),energy
+      real(WP), intent(out) :: eint
+      real(WP) :: rho,Tp,velocity(3)
+      valid=.false.; eint=0.0_WP
+      if (.not.all(particle_finite([mass,volume,momentum,energy]))) return
+      if (mass.le.0.0_WP.or.volume.le.0.0_WP) return
+      velocity=momentum/mass; rho=mass/volume
+      eint=energy/mass-0.5_WP*dot_product(velocity,velocity)
+      if (.not.all(particle_finite([rho,eint]))) return
+      Tp=water%get_T_from_rho_e(rho=rho,e=eint,y=[1.0_WP])
+      valid=particle_finite(Tp).and.Tp.gt.0.0_WP
+   end function particle_birth_state
+
    !> Remove unresolved liquid structures, turning them into particles or flotsam, and rebuild the gas state
-   subroutine transfer_drops(dt)
-      use mpi_f08,          only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_SUM,MPI_INTEGER
+   subroutine transfer_drops()
+      use mpi_f08,          only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_SUM
       use parallel,         only: MPI_REAL_WP
       use mathtools,        only: Pi
       use messager,         only: log
       use string,           only: str_long
       use amrex_amr_module, only: amrex_mfiter,amrex_box,amrex_multifab
       implicit none
-      real(WP), intent(in) :: dt
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx,fbx
-      type(amrex_multifab) :: VFsnap,work
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pId,pVF,pVFs,pQ,pCL,pCG,pPLIC,pRHOG,pPG,pWk
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW,pRHOU,pRHOV,pRHOW
+      type(amrex_multifab) :: work
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pId,pVF,pQ,pCL,pCG,pPLIC,pWk
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW,pRhoU,pRhoV,pRhoW
       integer,  dimension(:),   allocatable :: cid,cmap  !< Reduced labels and label -> index map, from label_and_moments
       real(WP), dimension(:,:), allocatable :: mom       !< (1:NMOM,1:size(cid)), filled by label_and_moments
       logical , dimension(:  ), allocatable :: remove,xfer
+      real(WP), dimension(:), allocatable :: birth_e
       type(part), dimension(:), allocatable, target :: pnew
       real(WP), dimension(3) :: L,Olo,X,Bd,Ud
       real(WP), dimension(2) :: mk
-      real(WP) :: vol,volmax,Vd,Md,wsum,gasadd,rhoeG
-      real(WP), parameter :: gas_eps=1.0e-3_WP   !< Least gas in a 3^3 neighborhood worth dividing by
-      integer :: lvl,ilvl,i,j,k,ii,jj,kk,n,m,nc,ns,np_new,nremove,ncreate,npend,nsweep,maxsweep,ierr
+      real(WP) :: vol,volmax,Vd,Md,gasadd,ag
+      real(WP), dimension(4) :: before,after,removed
+      integer :: lvl,ilvl,i,j,k,n,m,nc,ns,np_new,nremove,ncreate,ierr
       character(len=str_long) :: msg
       xfer_n_step=0; flot_n_step=0
       ! amrvof only carries PLIC/CL/CG at maxlvl, and only once the hierarchy has grown into it
@@ -1223,8 +1269,8 @@ contains
       cdx=amr%dx(lvl); cdy=amr%dy(lvl); cdz=amr%dz(lvl)
 
       ! Decide what goes; every rank holds the same global moments, so all ranks agree
-      allocate(remove(nc),xfer(nc)); remove=.false.; xfer=.false.
-      volmax=xfer_volcoeff*vol
+      allocate(remove(nc),xfer(nc),birth_e(nc)); remove=.false.; xfer=.false.; birth_e=0.0_WP
+      volmax=transfer_volume_limit()
       do m=1,nc
          n=cid(m)
          if (n.eq.core_id) cycle                    ! never transfer the core
@@ -1236,21 +1282,39 @@ contains
          if (ccl%struct(n)%has_coarse) then         ! removal below operates only at maxlvl
             xfer_fin(2)=xfer_fin(2)+1.0_WP; cycle
          end if
-         ! The barycenter must have left the core box (single-cell directions ignored, as in shock_droplet)
-         Bd=struct_barycenter(m,n)
-         if (.not.outside_core_box(Bd)) then
-            xfer_fin(3)=xfer_fin(3)+1.0_WP; cycle
+         ! Refuse atomically, before creating a particle or booking a flotsam deletion.
+         if (mom(22,m).le.0.0_WP) then
+            xfer_fin(3)=xfer_fin(3)+1.0_WP
+            xfer_refused=xfer_refused+1.0_WP
+            cycle
          end if
          remove(m)=.true.
-         ! Create a particle only above the minimum diameter; smaller structures are discarded as flotsam
+         ! Create a particle at or above the minimum diameter; strictly smaller structures are flotsam
          Vd=mom(1,m)
-         if ((6.0_WP*Vd/Pi)**(1.0_WP/3.0_WP).gt.xfer_diam_threshold*lp_dx) xfer(m)=.true.
+         if ((6.0_WP*Vd/Pi)**(1.0_WP/3.0_WP).ge.transfer_min_diameter()) xfer(m)=.true.
+         if (xfer(m)) then
+            if (.not.particle_birth_state(mom(2,m),Vd,mom(6:8,m),mom(15,m),birth_e(m))) then
+               remove(m)=.false.; xfer(m)=.false.
+               xfer_fin(4)=xfer_fin(4)+1.0_WP; xfer_badthermal=xfer_badthermal+1.0_WP
+            end if
+         end if
       end do
       nremove=count(remove)
       ncreate=count(xfer)
       xfer_n_step=ncreate
       flot_n_step=nremove-ncreate
       flot_n_total=flot_n_total+real(flot_n_step,WP)
+
+      ! No births, redistribution, or mesh writes when every component is refused.
+      if (nremove.eq.0) then
+         deallocate(cid,mom,cmap,remove,xfer,birth_e)
+         return
+      end if
+      call transfer_mesh_integrals(before)
+      removed=0.0_WP
+      do m=1,nc
+         if (remove(m)) removed=removed+[mom(6:8,m),mom(15,m)]
+      end do
 
       ! Build the new particles on root, then append collectively
       call tmr_xpart%start()
@@ -1262,6 +1326,8 @@ contains
          if (.not.xfer(m)) then
             flot_vol =flot_vol +Vd
             flot_mass=flot_mass+Md
+            flot_mom=flot_mom+mom(6:8,m)
+            flot_energy=flot_energy+mom(15,m)
             cycle
          end if
          Ud=mom(6:8,m)/Md
@@ -1270,18 +1336,20 @@ contains
          xfer_vol   =xfer_vol   +Vd
          xfer_mass  =xfer_mass  +Md
          xfer_momx  =xfer_momx  +Md*Ud(1)
+         xfer_momy  =xfer_momy  +Md*Ud(2)
+         xfer_momz  =xfer_momz  +Md*Ud(3)
          xfer_energy=xfer_energy+mom(15,m)   ! Q(3) is the liquid total energy, its kinetic part included
          if (.not.amr%amRoot) cycle
          np_new=np_new+1
          pnew(np_new)%pos   =Bd
-         pnew(np_new)%d     =(6.0_WP*Vd/Pi)**(1.0_WP/3.0_WP)   ! equal-volume sphere: mass is exact
+         pnew(np_new)%d     =(6.0_WP*Vd/Pi)**(1.0_WP/3.0_WP)   ! Preserve volume independently of mass
+         pnew(np_new)%mass  =Md
+         pnew(np_new)%eint  =birth_e(m)
          pnew(np_new)%vel   =Ud
          pnew(np_new)%angVel=0.0_WP
          pnew(np_new)%Acol  =0.0_WP
          pnew(np_new)%Tcol  =0.0_WP
          pnew(np_new)%dt    =0.0_WP                            ! let it find its own sub-step
-         ! GUNN HEAT TRANSFER (disabled): the particle is born at the structure's liquid temperature
-         ! pnew(np_new)%T = water%get_T_from_rho_e(rho=Md/Vd,e=(mom(15,m)-0.5_WP*Md*dot_product(Ud,Ud))/Md,y=[1.0_WP])
          pnew(np_new)%flag  =PART_MOVES+PART_EXCHANGES
          if (lp_collide) pnew(np_new)%flag=pnew(np_new)%flag+PART_COLLIDES
       end do
@@ -1290,12 +1358,6 @@ contains
       call lp%redistribute()
       deallocate(pnew)
       call tmr_xpart%stop()
-
-      ! Nothing was eligible, so leave the Eulerian state exactly as we found it
-      if (nremove.eq.0) then
-         deallocate(cid,mom,cmap,remove,xfer)
-         return
-      end if
 
       call tmr_surg%start()
 
@@ -1314,21 +1376,8 @@ contains
          call amr%mfiter_destroy(mfi)
       end do
 
-      ! Snapshot VF so the rebuild below reads the pre-surgery field
-      call amr%mfab_build(lvl=lvl,mfab=VFsnap,ncomp=1,nover=1)
-      call amr%mfiter_build(lvl,mfi,tiling=.false.)
-      do while (mfi%next())
-         pVF =>fs%VF%mf(lvl)%dataptr(mfi)
-         pVFs=>VFsnap%dataptr(mfi)
-         bx=mfi%growntilebox(1)
-         do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-                  pVFs(i,j,k,1)=pVF(i,j,k,1)
-               end do; end do; end do
-      end do
-      call amr%mfiter_destroy(mfi)
-
-      ! Scratch: 1 holds valid gas, 2:3 buffered Q2/Q4, 4 filled this sweep, 5 emptied by the surgery
-      call amr%mfab_build(lvl=lvl,mfab=work,ncomp=5,nover=1)
+      ! One mask marks cells emptied by surgery for the face-momentum rebuild.
+      call amr%mfab_build(lvl=lvl,mfab=work,ncomp=1,nover=1)
       call work%setval(0.0_WP)
       gasadd=0.0_WP
 
@@ -1337,52 +1386,33 @@ contains
       do while (mfi%next())
          pId   =>ccl%id%mf(lvl)%dataptr(mfi)
          pVF   =>fs%VF%mf(lvl)%dataptr(mfi)
-         pVFs  =>VFsnap%dataptr(mfi)
          pQ    =>fs%Q%mf(lvl)%dataptr(mfi)
          pCL   =>fs%CL%dataptr(mfi)
          pCG   =>fs%CG%dataptr(mfi)
          pPLIC =>fs%PLIC%dataptr(mfi)
-         pRHOG =>fs%RHOG%mf(lvl)%dataptr(mfi)
-         pPG   =>fs%PG%mf(lvl)%dataptr(mfi)
          pWk   =>work%dataptr(mfi)
          bx=mfi%validbox()
          do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                   n=nint(pId(i,j,k,1))
-                  ! Anything we are not emptying already holds a valid gas state
-                  if (n.le.0) then; pWk(i,j,k,1)=1.0_WP; cycle; end if
+                  if (n.le.0) cycle
                   m=cmap(n)
-                  if (m.eq.0) then; pWk(i,j,k,1)=1.0_WP; cycle; end if
-                  if (.not.remove(m)) then; pWk(i,j,k,1)=1.0_WP; cycle; end if
-                  pWk(i,j,k,5)=1.0_WP
-                  ! Remove liquid mass and energy (carried by the particle or discarded as flotsam)
+                  if (m.eq.0) cycle
+                  if (.not.remove(m)) cycle
+                  pWk(i,j,k,1)=1.0_WP
+                  ag=1.0_WP-pVF(i,j,k,1)
+                  gasadd=gasadd-vol*pQ(i,j,k,2)
+                  if (ag.ge.0.5_WP.and.pQ(i,j,k,2).gt.0.0_WP.and.pQ(i,j,k,4).gt.0.0_WP) then
+                     ! Keep the cell's own gas density and specific internal energy.
+                     pQ(i,j,k,2)=pQ(i,j,k,2)/ag
+                     pQ(i,j,k,4)=pQ(i,j,k,4)/ag
+                  else
+                     ! All ranks have the same component donor mean; no neighbor flood is needed.
+                     pQ(i,j,k,2)=mom(23,m)/mom(22,m)
+                     pQ(i,j,k,4)=mom(24,m)/mom(22,m)
+                  end if
+                  gasadd=gasadd+vol*pQ(i,j,k,2)
                   pQ(i,j,k,1)=0.0_WP
                   pQ(i,j,k,3)=0.0_WP
-                  ! Let the gas expand to fill the cell it now has to itself
-                  if (pVFs(i,j,k,1).lt.0.99_WP) then
-                     gasadd=gasadd-vol*pQ(i,j,k,2)
-                     pQ(i,j,k,2)=pQ(i,j,k,2)/(1.0_WP-pVFs(i,j,k,1))
-                     pQ(i,j,k,4)=pQ(i,j,k,4)/(1.0_WP-pVFs(i,j,k,1))
-                     gasadd=gasadd+vol*pQ(i,j,k,2)
-                     pWk(i,j,k,1)=1.0_WP
-                  else
-                     ! Little gas here: rebuild the gas state from the gas-weighted neighbourhood
-                     wsum=sum(1.0_WP-pVFs(i-1:i+1,j-1:j+1,k-1:k+1,1))
-                     if (wsum.gt.gas_eps) then
-                        gasadd=gasadd-vol*pQ(i,j,k,2)
-                        pQ(i,j,k,2)=sum((1.0_WP-pVFs(i-1:i+1,j-1:j+1,k-1:k+1,1))*pRHOG (i-1:i+1,j-1:j+1,k-1:k+1,1))/wsum
-                        rhoeG=0.0_WP
-                        do kk=k-1,k+1; do jj=j-1,j+1; do ii=i-1,i+1
-                                 if (pRHOG(ii,jj,kk,1).gt.0.0_WP) rhoeG=rhoeG+(1.0_WP-pVFs(ii,jj,kk,1))*pRHOG(ii,jj,kk,1)* &
-                                 &   gas%get_e_from_p_rho(p=pPG(ii,jj,kk,1),rho=pRHOG(ii,jj,kk,1),y=[1.0_WP])
-                              end do; end do; end do
-                        pQ(i,j,k,4)=rhoeG/wsum
-                        gasadd=gasadd+vol*pQ(i,j,k,2)
-                        pWk(i,j,k,1)=1.0_WP
-                     else
-                        ! No gas nearby: leave the cell pending for pass B
-                        pWk(i,j,k,1)=0.0_WP
-                     end if
-                  end if
                   ! Clear the liquid volume moments and plane, as apply_relax does for a cell that turns pure gas
                   pVF(i,j,k,1)=0.0_WP
                   X=[amr%xlo+(real(i,WP)+0.5_WP)*cdx,amr%ylo+(real(j,WP)+0.5_WP)*cdy,amr%zlo+(real(k,WP)+0.5_WP)*cdz]
@@ -1392,65 +1422,6 @@ contains
                end do; end do; end do
       end do
       call amr%mfiter_destroy(mfi)
-      call amr%mfab_destroy(VFsnap)
-
-      ! Pass B: flood a gas state inward one layer per sweep until no cell is pending
-      maxsweep=max(amr%nx,max(amr%ny,amr%nz))
-      do nsweep=1,maxsweep
-         ! Count what is still waiting
-         npend=0
-         call amr%mfiter_build(lvl,mfi,tiling=.false.)
-         do while (mfi%next())
-            pWk=>work%dataptr(mfi)
-            bx=mfi%validbox()
-            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-                     if (pWk(i,j,k,1).lt.0.5_WP) npend=npend+1
-                  end do; end do; end do
-         end do
-         call amr%mfiter_destroy(mfi)
-         call MPI_ALLREDUCE(MPI_IN_PLACE,npend,1,MPI_INTEGER,MPI_SUM,amr%comm,ierr)
-         if (npend.eq.0) exit
-         ! Ghosts have to be current for the state to cross box boundaries
-         call work%fill_boundary(amr%geom(lvl))
-         call fs%Q%mf(lvl)%fill_boundary(amr%geom(lvl))
-         ! Average whatever valid gas each pending cell can see
-         call amr%mfiter_build(lvl,mfi,tiling=.false.)
-         do while (mfi%next())
-            pQ=>fs%Q%mf(lvl)%dataptr(mfi)
-            pWk=>work%dataptr(mfi)
-            bx=mfi%validbox()
-            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-                     pWk(i,j,k,2:4)=0.0_WP
-                     if (pWk(i,j,k,1).gt.0.5_WP) cycle
-                     wsum=sum(pWk(i-1:i+1,j-1:j+1,k-1:k+1,1))
-                     if (wsum.le.0.0_WP) cycle
-                     pWk(i,j,k,2)=sum(pWk(i-1:i+1,j-1:j+1,k-1:k+1,1)*pQ(i-1:i+1,j-1:j+1,k-1:k+1,2))/wsum
-                     pWk(i,j,k,3)=sum(pWk(i-1:i+1,j-1:j+1,k-1:k+1,1)*pQ(i-1:i+1,j-1:j+1,k-1:k+1,4))/wsum
-                     pWk(i,j,k,4)=1.0_WP
-                  end do; end do; end do
-         end do
-         call amr%mfiter_destroy(mfi)
-         ! Commit the sweep
-         call amr%mfiter_build(lvl,mfi,tiling=.false.)
-         do while (mfi%next())
-            pQ=>fs%Q%mf(lvl)%dataptr(mfi)
-            pWk=>work%dataptr(mfi)
-            bx=mfi%validbox()
-            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-                     if (pWk(i,j,k,4).lt.0.5_WP) cycle
-                     gasadd=gasadd+vol*(pWk(i,j,k,2)-pQ(i,j,k,2))
-                     pQ(i,j,k,2)=pWk(i,j,k,2)
-                     pQ(i,j,k,4)=pWk(i,j,k,3)
-                     pWk(i,j,k,1)=1.0_WP
-                  end do; end do; end do
-         end do
-         call amr%mfiter_destroy(mfi)
-      end do
-      if (npend.gt.0.and.amr%amRoot) then
-         write(msg,'("[transfer_drops] gas rebuild left ",i0," cell(s) unfilled after ",i0," sweeps")') npend,maxsweep
-         call log(trim(msg))
-      end if
-
       ! Roll up the gas the surgery had to invent
       call MPI_ALLREDUCE(MPI_IN_PLACE,gasadd,1,MPI_REAL_WP,MPI_SUM,amr%comm,ierr)
       xfer_gasadd=xfer_gasadd+gasadd
@@ -1462,29 +1433,29 @@ contains
       call fs%VF%average_down(); call fs%Q%average_down()
       call fs%fill(time=time%t); call fs%Q%fill(time=time%t)
 
-      ! Pass C: on faces next to emptied cells, keep the face velocity and rebuild momentum from the new face density
+      ! Rebuild: on faces next to emptied cells, keep the face velocity and rebuild momentum from the new face density
       call work%fill_boundary(amr%geom(lvl))
       call amr%mfiter_build(lvl,mfi,tiling=.false.)
       do while (mfi%next())
          pQ=>fs%Q%mf(lvl)%dataptr(mfi)
          pWk=>work%dataptr(mfi)
-         pU=>fs%U%mf(lvl)%dataptr(mfi); pRHOU=>fs%rhoU%mf(lvl)%dataptr(mfi)
-         pV=>fs%V%mf(lvl)%dataptr(mfi); pRHOV=>fs%rhoV%mf(lvl)%dataptr(mfi)
-         pW=>fs%W%mf(lvl)%dataptr(mfi); pRHOW=>fs%rhoW%mf(lvl)%dataptr(mfi)
+         pU=>fs%U%mf(lvl)%dataptr(mfi); pRhoU=>fs%rhoU%mf(lvl)%dataptr(mfi)
+         pV=>fs%V%mf(lvl)%dataptr(mfi); pRhoV=>fs%rhoV%mf(lvl)%dataptr(mfi)
+         pW=>fs%W%mf(lvl)%dataptr(mfi); pRhoW=>fs%rhoW%mf(lvl)%dataptr(mfi)
          fbx=mfi%nodaltilebox(1)
          do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                  if (max(pWk(i-1,j,k,5),pWk(i,j,k,5)).lt.0.5_WP) cycle
-                  pRHOU(i,j,k,1)=max(0.5_WP*sum(pQ(i-1:i,j,k,1:2)),fs%rho_floor)*pU(i,j,k,1)
+                  if (max(pWk(i-1,j,k,1),pWk(i,j,k,1)).lt.0.5_WP) cycle
+                  pRhoU(i,j,k,1)=max(0.5_WP*sum(pQ(i-1:i,j,k,1:2)),fs%rho_floor)*pU(i,j,k,1)
                end do; end do; end do
          fbx=mfi%nodaltilebox(2)
          do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                  if (max(pWk(i,j-1,k,5),pWk(i,j,k,5)).lt.0.5_WP) cycle
-                  pRHOV(i,j,k,1)=max(0.5_WP*sum(pQ(i,j-1:j,k,1:2)),fs%rho_floor)*pV(i,j,k,1)
+                  if (max(pWk(i,j-1,k,1),pWk(i,j,k,1)).lt.0.5_WP) cycle
+                  pRhoV(i,j,k,1)=max(0.5_WP*sum(pQ(i,j-1:j,k,1:2)),fs%rho_floor)*pV(i,j,k,1)
                end do; end do; end do
          fbx=mfi%nodaltilebox(3)
          do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                  if (max(pWk(i,j,k-1,5),pWk(i,j,k,5)).lt.0.5_WP) cycle
-                  pRHOW(i,j,k,1)=max(0.5_WP*sum(pQ(i,j,k-1:k,1:2)),fs%rho_floor)*pW(i,j,k,1)
+                  if (max(pWk(i,j,k-1,1),pWk(i,j,k,1)).lt.0.5_WP) cycle
+                  pRhoW(i,j,k,1)=max(0.5_WP*sum(pQ(i,j,k-1:k,1:2)),fs%rho_floor)*pW(i,j,k,1)
                end do; end do; end do
       end do
       call amr%mfiter_destroy(mfi)
@@ -1493,6 +1464,8 @@ contains
       ! Back to total energies (this also recovers face velocities and primitives), then the cell velocity
       call fs%get_total_energy(time=time%t)
       call fs%get_cell_velocity()
+      call transfer_mesh_integrals(after)
+      xfer_refill=xfer_refill+after-before+removed
 
       ! Rebuild polygons and particle VF here, unless the regrid below does it
       if (.not.regrid_evt%occurs()) then
@@ -1508,7 +1481,7 @@ contains
          call log(trim(msg))
       end if
 
-      deallocate(cid,mom,cmap,remove,xfer)
+      deallocate(cid,mom,cmap,remove,xfer,birth_e)
 
    contains
 
@@ -1530,38 +1503,57 @@ contains
          end do
       end function struct_barycenter
 
-      !> True if the point lies outside the core box in a resolved direction
-      logical function outside_core_box(X0)
-         implicit none
-         real(WP), dimension(3), intent(in) :: X0
-         integer, dimension(3) :: ncell
-         integer :: dd
-         outside_core_box=.false.
-         ncell=[amr%nx,amr%ny,amr%nz]
-         do dd=1,3
-            if (ncell(dd).le.1) cycle
-            if (X0(dd).lt.corelo(dd)) outside_core_box=.true.
-            if (X0(dd).gt.corehi(dd)) outside_core_box=.true.
-         end do
-      end function outside_core_box
-
-      !> Mixture kinetic energy of a cell, a copy of amrmpcomp_class's private cell_ke (keep identical)
-      pure real(WP) function cell_ke(pQ,pU,pV,pW,i,j,k,rho_floor) result(ke)
-         implicit none
-         real(WP), dimension(:,:,:,:), contiguous, pointer, intent(in) :: pQ,pU,pV,pW
-         integer, intent(in) :: i,j,k
-         real(WP), intent(in) :: rho_floor
-         ke=0.25_WP*(max(0.5_WP*sum(pQ(i-1:i,j,k,1:2)),rho_floor)*pU(i,j,k,1)**2+max(0.5_WP*sum(pQ(i:i+1,j,k,1:2)),rho_floor)*pU(i+1,j,k,1)**2 &
-         &          +max(0.5_WP*sum(pQ(i,j-1:j,k,1:2)),rho_floor)*pV(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j:j+1,k,1:2)),rho_floor)*pV(i,j+1,k,1)**2 &
-         &          +max(0.5_WP*sum(pQ(i,j,k-1:k,1:2)),rho_floor)*pW(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j,k:k+1,1:2)),rho_floor)*pW(i,j,k+1,1)**2)
-      end function cell_ke
-
    end subroutine transfer_drops
 
 
+   !> Composite cell-centered momentum quadrature and total energy accounting.
+   !> Includes gas neighbors whose face masses/kinetic energies change during refill.
+   subroutine transfer_mesh_integrals(totals,mass)
+      use amrex_amr_module, only: amrex_mfiter,amrex_box,amrex_imultifab,amrex_imultifab_build,amrex_imultifab_destroy
+      use amrex_interface, only: amrmask_make_fine
+      use mpi_f08, only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_SUM
+      use parallel, only: MPI_REAL_WP
+      real(WP), intent(out) :: totals(4)
+      real(WP), intent(out), optional :: mass(2)
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      type(amrex_imultifab) :: mask
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pRhoU,pRhoV,pRhoW
+      integer, dimension(:,:,:,:), contiguous, pointer :: pMask
+      real(WP) :: vol,buf(6)
+      integer :: lvl,i,j,k,ierr
+      buf=0.0_WP
+      do lvl=0,amr%clvl()
+         vol=amr%cell_vol(lvl)
+         if (lvl.lt.amr%clvl()) then
+            call amrex_imultifab_build(mask,amr%ba(lvl),amr%dm(lvl),1,0)
+            call amrmask_make_fine(mask,amr%ba(lvl+1),[amr%rrefx(lvl),amr%rrefy(lvl),amr%rrefz(lvl)],0,1)
+         end if
+         call amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pQ=>fs%Q%mf(lvl)%dataptr(mfi)
+            pRhoU=>fs%rhoU%mf(lvl)%dataptr(mfi); pRhoV=>fs%rhoV%mf(lvl)%dataptr(mfi); pRhoW=>fs%rhoW%mf(lvl)%dataptr(mfi)
+            if (lvl.lt.amr%clvl()) pMask=>mask%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (lvl.lt.amr%clvl()) then
+                  if (pMask(i,j,k,1).eq.0) cycle
+               end if
+               buf=buf+vol*[0.5_WP*sum(pRhoU(i:i+1,j,k,1)),0.5_WP*sum(pRhoV(i,j:j+1,k,1)), &
+                  0.5_WP*sum(pRhoW(i,j,k:k+1,1)),sum(pQ(i,j,k,3:4)),pQ(i,j,k,1),pQ(i,j,k,2)]
+            end do; end do; end do
+         end do
+         call amr%mfiter_destroy(mfi)
+         if (lvl.lt.amr%clvl()) call amrex_imultifab_destroy(mask)
+      end do
+      call MPI_ALLREDUCE(MPI_IN_PLACE,buf,6,MPI_REAL_WP,MPI_SUM,amr%comm,ierr)
+      totals=buf(1:4)
+      if (present(mass)) mass=buf(5:6)
+   end subroutine transfer_mesh_integrals
+
    !> Initialization of problem solver
    subroutine simulation_init
-      use param, only: param_read
+      use param, only: param_read,param_exists
       implicit none
 
       ! Initialize AMR grid
@@ -1724,7 +1716,6 @@ contains
 
       ! Handle restart/saves here
       handle_restart: block
-         integer :: restart_step
          ! Initialize IO object
          call io%initialize(amr=amr,nfiles=128)
          ! Check if restarting
@@ -1749,6 +1740,7 @@ contains
          if (restarted) then
             call io%get_scalar('dt',time%dt)
             time%t=restart_time
+            time%n=restart_step
          end if
       end block initialize_timetracker
 
@@ -1762,7 +1754,11 @@ contains
          ! Provide pressure relaxation model
          call relax_model%initialize(gas=gas,liq=water); fs%relax=>relax_model
          relax_model%model=Prelax
-         relax_model%RHOGmin=0.0_WP
+         ! Refuse relaxations that leave the gas below 1e-2 (torrens); the model's own RHOGmin keeps its 1e-2 default
+         fs%rhoG_min=1.0e-2_WP
+         ! Positivity gate temperature floors (0: undeclared, a pure cell outside its law's domain stops the run)
+         call param_read('Liquid Tmin',fs%TminL,default=0.0_WP)
+         call param_read('Gas Tmin'   ,fs%TminG,default=0.0_WP)
          ! relax_model%vol=amr%cell_vol(amr%maxlvl)
          ! Small-cell agglomeration and clean_Q rescue limits are not available in the staggered solver
          ! fs%merge_sick=100.0_WP
@@ -1800,7 +1796,8 @@ contains
       ! Drop transfer objects register regrid callbacks, so they must exist before the grid is built
       create_transfer: block
          use mathtools, only: Pi
-         use messager, only: die
+         use amrdata_class, only: interp_none,interp_const
+         use messager, only: die,log
          call param_read('Drop transfer',do_transfer,default=.false.)
          ! CCL output is mandatory, including while transfer is disabled for debugging.
          call ccl%initialize(amr=amr,name='ccl')
@@ -1810,11 +1807,31 @@ contains
             ! Set density and drag model (Osnes et al. 2023) before initialize(), which prints them
             lp%rho=rhoL1
             call param_read('Particle drag model',lp%drag_model,default='Osnes')
+            ! This case uses isolated-sphere drag; retain deposited VF for diagnostics and coupling.
+            lp%drag_vf_override=0.0_WP
+            lp%total_energy_coupling=.true.
+            lp%cull_gas_free=.true.
+            lp%heat_material=>water
+            lp%heat_prandtl=Prandtl
+            if (.not.particle_finite(Prandtl).or.Prandtl.le.0.0_WP) call die('[particle heat] Prandtl must be positive')
             ! Lagrangian spray
             call lp%initialize(amr,name='spray',gas_gamma=gas%gamma)
             if (lp%nover.gt.min(fs%RHOG%ng,fs%PG%ng)) call die('[particle gas properties] insufficient primitive ghost width')
+            ! Source and normal cell widths for conservative averaging across refinement boundaries.
+            call spray_cells%initialize(amr,name='spray_cell_projection',ncomp=6,ng=1,interp=interp_const)
+            call spray_cells%register()
+            spray_cells%lo_bc(:,1:3)=lp%src%lo_bc(:,1:3); spray_cells%hi_bc(:,1:3)=lp%src%hi_bc(:,1:3)
+            spray_cells%lo_bc(:,4:6)=lp%src%lo_bc(:,1:3); spray_cells%hi_bc(:,4:6)=lp%src%hi_bc(:,1:3)
+            call spray_energy%initialize(amr,name='spray_energy_rate',ncomp=1,ng=0,interp=interp_none)
+            call spray_energy%register()
+            call spray_force(1)%initialize(amr,name='spray_xforce_rate',ncomp=1,ng=0,nodal=[.true.,.false.,.false.],interp=interp_none)
+            call spray_force(2)%initialize(amr,name='spray_yforce_rate',ncomp=1,ng=0,nodal=[.false.,.true.,.false.],interp=interp_none)
+            call spray_force(3)%initialize(amr,name='spray_zforce_rate',ncomp=1,ng=0,nodal=[.false.,.false.,.true.],interp=interp_none)
+            call spray_force(1)%register(); call spray_force(2)%register(); call spray_force(3)%register()
             call particle_gas%initialize(amr,name='particle_gas',ncomp=2,ng=lp%nover)
             call particle_gas%register()
+            call particle_thermal%initialize(amr,name='particle_thermal',ncomp=2,ng=lp%nover)
+            call particle_thermal%register()
             call particle_gas_fraction%initialize(amr,name='particle_gas_fraction',ncomp=1,ng=lp%nover)
             call particle_gas_fraction%register()
             call particle_stress%initialize(amr,name='particle_stress',ncomp=3,ng=lp%nover)
@@ -1829,16 +1846,25 @@ contains
             call param_read('Particle max CFL'   ,lp%cflmax    ,default=0.5_WP)
             ! Optional trace of the particles with maximum Re, Ma and Kn (diagnostic restarts only)
             call param_read('Particle drag diagnostics',lp%drag_diagnostics,default=.false.)
-            ! Transfer size threshold, used to check the maximum particle/coupling-cell diameter ratio
-            call param_read('Drop transfer volume coeff',xfer_volcoeff,default=24.0_WP)
-            ! Structures below this equal-volume diameter, in particle-grid cells, are discarded as flotsam
-            call param_read('Drop transfer diameter threshold',xfer_diam_threshold,default=1.0e-1_WP)
-            if (xfer_diam_threshold.lt.0.0_WP) &
-            &   call die('[amrcomp_drop_lpt_prod] Drop transfer diameter threshold must be non-negative')
-            ! Largest transferable diameter relative to the particle-coupling cell
-            xfer_dmax=(6.0_WP*xfer_volcoeff*amr%cell_vol(amr%maxlvl)/Pi)**(1.0_WP/3.0_WP)
+            ! Diameter limits: maximum uses the coupling cap; minimum always uses the finest grid.
+            if (param_exists('Drop transfer volume coeff')) &
+            &   call die('[transfer] replace Drop transfer volume coeff with Drop transfer maximum diameter ratio (coupling-cell units)')
+            call param_read('Drop transfer maximum diameter ratio',xfer_dmax_ratio,default=1.0_WP)
+            call param_read('Drop transfer diameter threshold',xfer_diam_threshold,default=0.1_WP)
+            if (xfer_dmax_ratio.le.0.0_WP.or.xfer_diam_threshold.lt.0.0_WP) &
+            &   call die('[transfer] maximum diameter ratio must be positive; minimum threshold must be non-negative')
             lp_dx=amr%min_meshsize(lp%maxlvl)
+            xfer_dmax=xfer_dmax_ratio*lp_dx
+            if (transfer_min_diameter().gt.xfer_dmax) call die('[transfer] minimum diameter exceeds maximum diameter')
             lp_dres=xfer_dmax/lp_dx
+            call log('[transfer] minimum diameter uses finest-grid spacing; maximum uses coupling-cap spacing')
+            transfer_limits: block
+               character(len=160) :: limits
+               write(limits,'("[transfer] dmin=",es14.6," dmax=",es14.6)') transfer_min_diameter(),xfer_dmax
+               call log(trim(limits))
+               write(limits,'("[transfer] particle maxlvl=",i0," coupling dx=",es14.6," maximum d/dx=",es14.6)') lp%maxlvl,lp_dx,lp_dres
+               call log(trim(limits))
+            end block transfer_limits
             call param_read('Particle maximum d/dx',lp_dres_limit,default=1.0_WP)
             if (lp_dres_limit.le.0.0_WP) call die('[amrcomp_drop_lpt] Particle maximum d/dx must be positive')
             if (lp_dres.gt.lp_dres_limit*(1.0_WP+100.0_WP*epsilon(1.0_WP))) &
@@ -1847,19 +1873,13 @@ contains
             call param_read('Particle filter width',lp%filter_width,default=0.0_WP)
             ! filter_ncell=3 puts a 3.5*dx filter on the particle level
             lp%filter_ncell=3
-            ! Coupling-mesh diagnostics
-            lp_maxlvl_r=lp%maxlvl
             call param_read('Particle max dt'    ,lp%dtmax     ,default=time%dtmax)
             call param_read('Particle collisions',lp_collide   ,default=.false.)
-            ! GUNN HEAT TRANSFER (disabled): needs a liquid specific heat; see the other GUNN blocks and amrlpt
-            ! call param_read('Particle Cp',lp%Cp,default=water%get_cv_from_rho_T(rho=rhoL1,T=1.0_WP,y=[1.0_WP]))
             if (lp_collide) call param_read('Particle collision time',lp%tau_col,default=10.0_WP*time%dtmax)
             lp%dt=lp%dtmax
-            ! Liquid viscosity for particles engulfed by resolved liquid (same constant as get_viscosities)
-            lp%visc_immersed=visc_ratio/Reynolds
             call param_read('Particle max substeps',lp%nsub_max,default=1000)
 
-            ! Clearance a fragment must clear beyond the core's bounding box; <0 selects 0.5*d_drop
+            ! Core-box padding for wake tagging only; <0 selects 0.5*d_drop
             call param_read('Drop transfer margin'      ,xfer_margin,default=-1.0_WP)
             ! Particles leave through the open x/y boundaries; z is the periodic quasi-2D direction
             lp%lo_bc=AMRLPT_OPEN; lp%hi_bc=AMRLPT_OPEN
@@ -1937,10 +1957,52 @@ contains
                call io%get_scalar('xfer_momx'  ,val,found); if (found) xfer_momx  =val
                call io%get_scalar('xfer_energy',val,found); if (found) xfer_energy=val
                call io%get_scalar('xfer_gasadd',val,found); if (found) xfer_gasadd=val
+               call io%get_scalar('refill_energy',val,found); if (found) xfer_refill(4)=val
+               call io%get_scalar('refill_momz',val,found); if (found) xfer_refill(3)=val
+               call io%get_scalar('refill_momy',val,found); if (found) xfer_refill(2)=val
+               call io%get_scalar('refill_momx',val,found); if (found) xfer_refill(1)=val
+               call io%get_scalar('xfer_refused',val,found); if (found) xfer_refused=val
+               call io%get_scalar('xfer_badthermal',val,found); if (found) xfer_badthermal=val
+               call io%get_scalar('cull_count',val,found); if (found) lp%np_culled_tot=val
+               call io%get_scalar('cull_mass',val,found); if (found) lp%culled(1)=val
+               call io%get_scalar('cull_momx',val,found); if (found) lp%culled(2)=val
+               call io%get_scalar('cull_momy',val,found); if (found) lp%culled(3)=val
+               call io%get_scalar('cull_momz',val,found); if (found) lp%culled(4)=val
+               call io%get_scalar('cull_energy',val,found); if (found) lp%culled(5)=val
+               call io%get_scalar('exchange_heat',val,found); if (found) lp%heat_exchange=val
+               call io%get_scalar('exchange_px',val,found); if (found) lp%exchange(1)=val
+               call io%get_scalar('exchange_py',val,found); if (found) lp%exchange(2)=val
+               call io%get_scalar('exchange_pz',val,found); if (found) lp%exchange(3)=val
+               call io%get_scalar('exchange_mech',val,found); if (found) lp%exchange(4)=val
+               call io%get_scalar('drag_dissipation',val,found); if (found) lp%exchange(5)=val
+               call io%get_scalar('out_mass',val,found); if (found) lp%outflow(1)=val
+               call io%get_scalar('out_momx',val,found); if (found) lp%outflow(2)=val
+               call io%get_scalar('out_momy',val,found); if (found) lp%outflow(3)=val
+               call io%get_scalar('out_momz',val,found); if (found) lp%outflow(4)=val
+               call io%get_scalar('out_energy',val,found); if (found) lp%outflow(5)=val
                call io%get_scalar('flot_n_total',val,found); if (found) flot_n_total=val
                call io%get_scalar('flot_vol'    ,val,found); if (found) flot_vol    =val
+               call io%get_scalar('xfer_momy',val,found); if (found) xfer_momy=val
+               call io%get_scalar('xfer_momz',val,found); if (found) xfer_momz=val
+               call io%get_scalar('flot_momx',val,found); if (found) flot_mom(1)=val
+               call io%get_scalar('flot_momy',val,found); if (found) flot_mom(2)=val
+               call io%get_scalar('flot_momz',val,found); if (found) flot_mom(3)=val
+               call io%get_scalar('flot_energy',val,found); if (found) flot_energy=val
                call io%get_scalar('flot_mass'   ,val,found); if (found) flot_mass   =val
             end block restore_ledger
+         end if
+         ! Restore the regrid ledger from the checkpoint
+         if (restarted) then
+            restore_regrid: block
+               real(WP) :: val
+               logical  :: found
+               call io%get_scalar('regrid_massL' ,val,found); if (found) regrid_book(1)=val
+               call io%get_scalar('regrid_massG' ,val,found); if (found) regrid_book(2)=val
+               call io%get_scalar('regrid_momx'  ,val,found); if (found) regrid_book(3)=val
+               call io%get_scalar('regrid_momy'  ,val,found); if (found) regrid_book(4)=val
+               call io%get_scalar('regrid_momz'  ,val,found); if (found) regrid_book(5)=val
+               call io%get_scalar('regrid_energy',val,found); if (found) regrid_book(6)=val
+            end block restore_regrid
          end if
       end block init_regridding
 
@@ -1958,12 +2020,48 @@ contains
             call io%add_scalar(name='xfer_momx'  ,value=xfer_momx)
             call io%add_scalar(name='xfer_energy',value=xfer_energy)
             call io%add_scalar(name='xfer_gasadd',value=xfer_gasadd)
+            call io%add_scalar(name='refill_energy',value=xfer_refill(4))
+            call io%add_scalar(name='refill_momz',value=xfer_refill(3))
+            call io%add_scalar(name='refill_momy',value=xfer_refill(2))
+            call io%add_scalar(name='refill_momx',value=xfer_refill(1))
+            call io%add_scalar(name='xfer_refused',value=xfer_refused)
+            call io%add_scalar(name='xfer_badthermal',value=xfer_badthermal)
+            call io%add_scalar(name='cull_count',value=lp%np_culled_tot)
+            call io%add_scalar(name='cull_mass',value=lp%culled(1))
+            call io%add_scalar(name='cull_momx',value=lp%culled(2))
+            call io%add_scalar(name='cull_momy',value=lp%culled(3))
+            call io%add_scalar(name='cull_momz',value=lp%culled(4))
+            call io%add_scalar(name='cull_energy',value=lp%culled(5))
+            call io%add_scalar(name='exchange_heat',value=lp%heat_exchange)
+            call io%add_scalar(name='exchange_px',value=lp%exchange(1))
+            call io%add_scalar(name='exchange_py',value=lp%exchange(2))
+            call io%add_scalar(name='exchange_pz',value=lp%exchange(3))
+            call io%add_scalar(name='exchange_mech',value=lp%exchange(4))
+            call io%add_scalar(name='drag_dissipation',value=lp%exchange(5))
+            call io%add_scalar(name='out_mass',value=lp%outflow(1))
+            call io%add_scalar(name='out_momx',value=lp%outflow(2))
+            call io%add_scalar(name='out_momy',value=lp%outflow(3))
+            call io%add_scalar(name='out_momz',value=lp%outflow(4))
+            call io%add_scalar(name='out_energy',value=lp%outflow(5))
             call io%add_scalar(name='flot_n_total',value=flot_n_total)
             call io%add_scalar(name='flot_vol'    ,value=flot_vol)
+            call io%add_scalar(name='xfer_momy',value=xfer_momy)
+            call io%add_scalar(name='xfer_momz',value=xfer_momz)
+            call io%add_scalar(name='flot_momx',value=flot_mom(1))
+            call io%add_scalar(name='flot_momy',value=flot_mom(2))
+            call io%add_scalar(name='flot_momz',value=flot_mom(3))
+            call io%add_scalar(name='flot_energy',value=flot_energy)
             call io%add_scalar(name='flot_mass'   ,value=flot_mass)
          end if
          ! Add dt to checkpoint save
          call io%add_scalar(name='dt',value=time%dt)
+         ! Checkpoint the regrid ledger
+         call io%add_scalar(name='regrid_massL' ,value=regrid_book(1))
+         call io%add_scalar(name='regrid_massG' ,value=regrid_book(2))
+         call io%add_scalar(name='regrid_momx'  ,value=regrid_book(3))
+         call io%add_scalar(name='regrid_momy'  ,value=regrid_book(4))
+         call io%add_scalar(name='regrid_momz'  ,value=regrid_book(5))
+         call io%add_scalar(name='regrid_energy',value=regrid_book(6))
       end block init_checkpoint
 
       ! Per-phase timers, created before the initial labelling that uses some of them
@@ -2049,6 +2147,8 @@ contains
             call lpviz%select_comp('d'   ,.true.)
             call lpviz%select_comp('vel' ,.true.)
             call lpviz%select_comp('flag',.true.)
+            call lpviz%select_comp('mass',.true.)
+            call lpviz%select_comp('eint',.true.)
             lpviz_evt=event(time=time,name='Spray visualization output')
             call param_read('Spray output period',lpviz_evt%tper,default=viz_evt%tper)
          end if
@@ -2131,6 +2231,12 @@ contains
          call consfile%add_column(fs%rhoVint,'V Momentum')
          call consfile%add_column(fs%rhoWint,'W Momentum')
          call consfile%add_column(fs%rhoKint,'Kinetic energy')
+         call consfile%add_column(regrid_book(1),'Regrid liquid mass')
+         call consfile%add_column(regrid_book(2),'Regrid gas mass')
+         call consfile%add_column(regrid_book(3),'Regrid U momentum')
+         call consfile%add_column(regrid_book(4),'Regrid V momentum')
+         call consfile%add_column(regrid_book(5),'Regrid W momentum')
+         call consfile%add_column(regrid_book(6),'Regrid energy')
          call consfile%write()
          ! Create grid monitor
          gridfile=monitor(amRoot=amr%amRoot,name='grid')
@@ -2183,6 +2289,7 @@ contains
          call rescfile%add_column(fs%nvf_guard,'VF guard cells')
          call rescfile%add_column(fs%nsliver,'Sliver cells')
          call rescfile%add_column(fs%ngate,'Gate cells')
+         call rescfile%add_column(fs%ngate_floor,'Gate floors')
          call rescfile%add_column(fs%gate_mass,'Gate mass')
          call rescfile%add_column(fs%gate_energy,'Gate energy')
          call rescfile%add_column(fs%gate_rhoU,'Gate U momentum')
@@ -2241,24 +2348,56 @@ contains
             call sprayfile%add_column(xfer_vol,'Xfer volume')
             call sprayfile%add_column(xfer_mass,'Xfer mass')
             call sprayfile%add_column(flot_vol,'Flot volume')
+            call sprayfile%add_column(xfer_momy,'Xfer momy')
+            call sprayfile%add_column(xfer_momz,'Xfer momz')
+            call sprayfile%add_column(flot_mom(1),'Flot momx')
+            call sprayfile%add_column(flot_mom(2),'Flot momy')
+            call sprayfile%add_column(flot_mom(3),'Flot momz')
+            call sprayfile%add_column(flot_energy,'Flot energy')
             call sprayfile%add_column(flot_mass,'Flot mass')
             call sprayfile%add_column(xfer_momx,'Xfer momx')
             call sprayfile%add_column(xfer_energy,'Xfer energy')
             call sprayfile%add_column(xfer_gasadd,'Gas added')
-            call sprayfile%add_column(lp_maxlvl_r,'lp maxlvl')
+            call sprayfile%add_column(xfer_refill(1),'Refill momx')
+            call sprayfile%add_column(xfer_refill(2),'Refill momy')
+            call sprayfile%add_column(xfer_refill(3),'Refill momz')
+            call sprayfile%add_column(xfer_refill(4),'Refill energy')
+            call sprayfile%add_column(xfer_refused,'Refused total')
             call sprayfile%add_column(lp%occupied_minlvl,'lp lvl min')
             call sprayfile%add_column(lp%occupied_maxlvl,'lp lvl max')
             call sprayfile%add_column(lp%np_above_maxlvl,'Np above cap')
             call sprayfile%add_column(lp%np_demoted,'Np demoted')
-            call sprayfile%add_column(lp_dx,'lp dx')
-            call sprayfile%add_column(lp_dres,'d/dx couple')
             call sprayfile%add_column(lp%dmin,'dmin')
             call sprayfile%add_column(lp%dmax,'dmax')
             call sprayfile%add_column(lp%dmean,'dmean')
             call sprayfile%add_column(lp%Umean,'Umean')
             call sprayfile%add_column(lp%Vp_tot,'Vp total')
+            call sprayfile%add_column(lp%mass_tot,'Particle mass')
+            call sprayfile%add_column(lp%momentum_tot(1),'Particle momx')
+            call sprayfile%add_column(lp%momentum_tot(2),'Particle momy')
+            call sprayfile%add_column(lp%momentum_tot(3),'Particle momz')
+            call sprayfile%add_column(lp%kinetic_tot,'Particle KE')
+            call sprayfile%add_column(lp%internal_tot,'Particle IE')
+            call sprayfile%add_column(lp%outflow(1),'Exit mass')
+            call sprayfile%add_column(lp%outflow(2),'Exit momx')
+            call sprayfile%add_column(lp%outflow(3),'Exit momy')
+            call sprayfile%add_column(lp%outflow(4),'Exit momz')
+            call sprayfile%add_column(lp%outflow(5),'Exit energy')
             ! Coupling ledger and drag-regime diagnostics
             call sprayfile%add_column(src_momx,'Src momx')
+            call sprayfile%add_column(lp%np_culled,'Cull step')
+            call sprayfile%add_column(lp%np_culled_tot,'Cull total')
+            call sprayfile%add_column(lp%culled(1),'Cull mass')
+            call sprayfile%add_column(lp%culled(2),'Cull momx')
+            call sprayfile%add_column(lp%culled(3),'Cull momy')
+            call sprayfile%add_column(lp%culled(4),'Cull momz')
+            call sprayfile%add_column(lp%culled(5),'Cull energy')
+            call sprayfile%add_column(lp%heat_exchange,'Fluid heat E')
+            call sprayfile%add_column(lp%exchange(1),'Fluid Jx')
+            call sprayfile%add_column(lp%exchange(2),'Fluid Jy')
+            call sprayfile%add_column(lp%exchange(3),'Fluid Jz')
+            call sprayfile%add_column(lp%exchange(4),'Fluid mech E')
+            call sprayfile%add_column(lp%exchange(5),'Drag dissip')
             call sprayfile%add_column(src_ener,'Src energy')
             call sprayfile%add_column(src_emin,'Src emin')
             call sprayfile%add_column(lp%Remax,'Re max')
@@ -2267,18 +2406,16 @@ contains
             call sprayfile%add_column(corelo(1),'Core xlo')
             call sprayfile%add_column(corehi(1),'Core xhi')
             call sprayfile%add_column(src_dumax,'Src du max')
-            call sprayfile%add_column(lp%np_immersed    ,'Np immersed')
-            call sprayfile%add_column(lp%np_immersed_tot,'Np immersed tot')
             call sprayfile%add_column(lp%np_substep_capped,'Np capped')
-            call sprayfile%add_column(lp%E_immersed     ,'E immersed')
             ! Candidate census (see label_and_moments and transfer_drops)
             call sprayfile%add_column(xfer_ncand ,'Ncand')
             call sprayfile%add_column(xfer_rej(1),'Rej coarse')
             call sprayfile%add_column(xfer_rej(2),'Rej volume')
-            call sprayfile%add_column(xfer_rej(3),'Rej inbox')
             call sprayfile%add_column(xfer_fin(1),'Fin volume')
             call sprayfile%add_column(xfer_fin(2),'Fin coarse')
-            call sprayfile%add_column(xfer_fin(3),'Fin inbox')
+            call sprayfile%add_column(xfer_fin(3),'Fin no donor')
+            call sprayfile%add_column(xfer_fin(4),'Fin bad thermal')
+            call sprayfile%add_column(xfer_badthermal,'Bad thermal total')
             call sprayfile%add_column(core_fallbacks,'Core fallback')
             call sprayfile%write()
          end if
@@ -2354,10 +2491,11 @@ contains
                call lp%advance_to(time=time%t,do_collide=lp_collide, &
                &                  U=fs%U,Ucomp=1,V=fs%V,Vcomp=1,W=fs%W,Wcomp=1, &
                &                  rho=fs%RHOG,rhocomp=1,visc=particle_gas,visccomp=1,snd=particle_gas,sndcomp=2, &
-               &                  stress_div=particle_stress,gas_fraction=particle_gas_fraction)
+               &                  stress_div=particle_stress,gas_fraction=particle_gas_fraction,thermal=particle_thermal)
                ! Keep this step's deposited source even if the last particle has just exited.
                spray_source_ready=.true.
-               ! GUNN HEAT TRANSFER (disabled): also pass T=fs%TG,Tcomp=1 once amrlpt carries p%T
+               call prepare_spray_rates()
+               ! src(4) now includes mechanical work and minus the accepted particle heat increment.
                ! get_info also resets amrlpt's internal timers, so harvest them here
                call tmr_lptinfo%start(); call lp%get_info(); call tmr_lptinfo%stop(); lp_np=lp%np
                t_lptstep=lp%tmr_step%tmax; t_lptsrc=lp%tmr_src%tmax; t_lptvf=lp%tmr_vf%tmax
@@ -2396,7 +2534,11 @@ contains
             call tmr_rk%stop()
 
             ! Phasic total energies of the new iterate: transported internal energy, phasic work, and kinetic energy
-            call fs%get_energy(dt=time%dt,time=time%t)
+            if (spray_source_ready) then
+               call fs%get_energy(dt=time%dt,time=time%t,energy_source=spray_energy,force_source=spray_force)
+            else
+               call fs%get_energy(dt=time%dt,time=time%t)
+            end if
 
             ! Rebuild PLIC of the new iterate (the band sweep only uses the old PLIC)
             call fs%build_plic(time=time%t)
@@ -2423,7 +2565,7 @@ contains
             xfer_n_step=0; flot_n_step=0; xfer_fin=0.0_WP
             if (xfer_evt%occurs()) then
                call tmr_xfer%start()
-               call transfer_drops(time%dt)
+               call transfer_drops()
                call tmr_xpart%start(); call lp%get_info(); lp_np=lp%np; call tmr_xpart%stop()
                call tmr_xfer%stop()
             end if
@@ -2451,7 +2593,14 @@ contains
          regridded=regrid_evt%occurs()
          if (regridded) then
             call tmr_regrid%start()
-            call amr%regrid(baselvl=0,time=time%t)
+            ! Book the change the regrid makes to the uncovered-cell mass, momentum and total energy
+            book_regrid: block
+               real(WP) :: mass0(2),mass1(2),tot0(4),tot1(4)
+               call transfer_mesh_integrals(tot0,mass0)
+               call amr%regrid(baselvl=0,time=time%t)
+               call transfer_mesh_integrals(tot1,mass1)
+               regrid_book=regrid_book+[mass1-mass0,tot1-tot0]
+            end block book_regrid
             call fs%build_polygons()
             call gridfile%write()
             call tmr_regrid%stop()
@@ -2619,43 +2768,59 @@ contains
          call MPI_ALLREDUCE(MPI_IN_PLACE,src_emin,1,MPI_REAL_WP,MPI_MIN,amr%comm,ierr)
       end subroutine spray_ledger
 
-      !> Add the spray momentum reaction, averaged to faces, to the RHS (drag dissipation src(4) is not applied)
+      !> Apply the frozen rates to each new RHS, which updates from the old flow state.
       subroutine add_spray_source()
-         use amrex_amr_module, only: amrex_mfiter,amrex_box
-         implicit none
-         type(amrex_mfiter) :: mfi
-         type(amrex_box) :: fbx
-         real(WP), dimension(:,:,:,:), contiguous, pointer :: pS,pDU,pDV,pDW
-         real(WP) :: rdt
-         integer :: lvl,i,j,k
-         if (.not.do_transfer) return
          if (.not.spray_source_ready) return
-         rdt=1.0_WP/dt_src
-         do lvl=0,amr%clvl()
-            call amr%mfiter_build(lvl,mfi)
-            do while (mfi%next())
-               pS =>lp%src%mf(lvl)%dataptr(mfi)
-               pDU=>drhoUdt%mf(lvl)%dataptr(mfi)
-               pDV=>drhoVdt%mf(lvl)%dataptr(mfi)
-               pDW=>drhoWdt%mf(lvl)%dataptr(mfi)
-               fbx=mfi%nodaltilebox(1)
-               do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                        pDU(i,j,k,1)=pDU(i,j,k,1)+0.5_WP*rdt*(pS(i-1,j,k,1)+pS(i,j,k,1))
-                     end do; end do; end do
-               fbx=mfi%nodaltilebox(2)
-               do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                        pDV(i,j,k,1)=pDV(i,j,k,1)+0.5_WP*rdt*(pS(i,j-1,k,2)+pS(i,j,k,2))
-                     end do; end do; end do
-               fbx=mfi%nodaltilebox(3)
-               do k=fbx%lo(3),fbx%hi(3); do j=fbx%lo(2),fbx%hi(2); do i=fbx%lo(1),fbx%hi(1)
-                        pDW(i,j,k,1)=pDW(i,j,k,1)+0.5_WP*rdt*(pS(i,j,k-1,3)+pS(i,j,k,3))
-                     end do; end do; end do
-            end do
-            call amr%mfiter_destroy(mfi)
-         end do
+         call drhoUdt%add(spray_force(1))
+         call drhoVdt%add(spray_force(2))
+         call drhoWdt%add(spray_force(3))
       end subroutine add_spray_source
 
    end subroutine simulation_run
+
+   !> Convert accumulated particle increments to rates once; reuse these exact faces in get_energy.
+   subroutine prepare_spray_rates()
+      use amrex_amr_module, only: amrex_mfiter,amrex_box
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pS,pF
+      integer :: lvl,i,j,k
+      call spray_cells%copy(lp%src,srccomp=1,dstcomp=1,ncomp=3)
+      do lvl=0,amr%clvl()
+         call spray_cells%mf(lvl)%setval(amr%dx(lvl),icomp=4,ncomp=1)
+         call spray_cells%mf(lvl)%setval(amr%dy(lvl),icomp=5,ncomp=1)
+         call spray_cells%mf(lvl)%setval(amr%dz(lvl),icomp=6,ncomp=1)
+      end do
+      ! Piecewise-constant coarse ghost values retain the adjacent coarse cell's source and width.
+      ! A face owns half of each adjacent cell volume: F=(hL*SL+hR*SR)/(hL+hR).
+      ! This reduces to the original arithmetic average away from a coarse/fine interface.
+      call spray_cells%fill(time=time%t)
+      call spray_energy%copy(lp%src,srccomp=4,dstcomp=1,ncomp=1)
+      call spray_energy%mult(1.0_WP/dt_src)
+      do lvl=0,amr%clvl()
+         call amr%mfiter_build(lvl,mfi)
+         do while(mfi%next())
+            pS=>spray_cells%mf(lvl)%dataptr(mfi)
+            pF=>spray_force(1)%mf(lvl)%dataptr(mfi); bx=mfi%nodaltilebox(1)
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               pF(i,j,k,1)=(pS(i-1,j,k,4)*pS(i-1,j,k,1)+pS(i,j,k,4)*pS(i,j,k,1))/(pS(i-1,j,k,4)+pS(i,j,k,4))/dt_src
+            end do; end do; end do
+            pF=>spray_force(2)%mf(lvl)%dataptr(mfi); bx=mfi%nodaltilebox(2)
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               pF(i,j,k,1)=(pS(i,j-1,k,5)*pS(i,j-1,k,2)+pS(i,j,k,5)*pS(i,j,k,2))/(pS(i,j-1,k,5)+pS(i,j,k,5))/dt_src
+            end do; end do; end do
+            pF=>spray_force(3)%mf(lvl)%dataptr(mfi); bx=mfi%nodaltilebox(3)
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               pF(i,j,k,1)=(pS(i,j,k-1,6)*pS(i,j,k-1,3)+pS(i,j,k,6)*pS(i,j,k,3))/(pS(i,j,k-1,6)+pS(i,j,k,6))/dt_src
+            end do; end do; end do
+         end do
+         call amr%mfiter_destroy(mfi)
+      end do
+      ! Momentum recovery restricts/overrides faces too; use the identical synchronized force
+      ! in the momentum RHS and energy work, including the coarse side of refinement interfaces.
+      call fs%sync_momentum(spray_force(1),spray_force(2),spray_force(3))
+   end subroutine prepare_spray_rates
+
 
    !> Droplet QOIs for all liquid (isocontour family) and for the largest structure (core family)
    subroutine compute_drop_metrics()
@@ -2827,7 +2992,11 @@ contains
       ! Finalize drop transfer
       call ccl%finalize()
       if (do_transfer) then
+         call spray_cells%finalize()
+         call spray_energy%finalize()
+         call spray_force(1)%finalize(); call spray_force(2)%finalize(); call spray_force(3)%finalize()
          call particle_stress%finalize()
+         call particle_thermal%finalize()
          call particle_gas%finalize()
          call particle_gas_fraction%finalize()
          call lp%finalize()

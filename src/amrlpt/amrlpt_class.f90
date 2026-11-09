@@ -1,7 +1,7 @@
 !> AMR-aware Lagrangian particle tracking solver
 !> Mirrors lpt_class capabilities on an AMReX AMR hierarchy.
-!> Particle communication and sorting handled by NeighborParticleContainer<14,1>.
 module amrlpt_class
+   use material_class, only: material
    use precision,     only: WP,I8
    use string,        only: str_medium
    use amrgrid_class, only: amrgrid
@@ -12,14 +12,14 @@ module amrlpt_class
    private
 
    ! Public exports
-   public :: amrlpt,part
+   public :: amrlpt,part,particle_finite
 
    ! Boundary condition flags for collision detection
    integer, parameter, public :: AMRLPT_OPEN=0  !< No wall collision (open or periodic boundary)
    integer, parameter, public :: AMRLPT_WALL=1  !< Hard wall collision at domain boundary
 
    ! Particle struct layout constants (must match #define in amrlpt_wrapper.cpp)
-   integer, parameter, public :: AMRLPT_NREAL=14  !< extra reals per particle
+   integer, parameter, public :: AMRLPT_NREAL=16  !< extra reals per particle
    integer, parameter, public :: AMRLPT_NINT =1   !< extra ints  per particle
 
    ! Particle flags
@@ -28,21 +28,23 @@ module amrlpt_class
    integer(c_int), parameter, public :: PART_EXCHANGES=4
    integer(c_int), parameter, public :: PART_IS_DEAD  =0
 
-   ! Particle struct -- must match C++ Particle<14,1> memory layout exactly:
+   ! Particle struct -- must match C++ Particle<16,1> memory layout exactly:
    ! - pos[3]    (pos, managed by AMReX)
-   ! - rdata[14] (d, vel[3], angVel[3], Acol[3], Tcol[3], dt)
+   ! - rdata[16] (d, vel[3], angVel[3], Acol[3], Tcol[3], dt, mass, eint)
    ! - idcpu     (packed id+cpu, private)
    ! - idata[1]  (flag)
    type, bind(C), public :: part
       !> AMReX position (physical coordinates)
       real(c_double) :: pos(3)
-      !> Extra reals (NStructReal=14)
+      !> Extra reals (NStructReal=16)
       real(c_double) :: d               !< Particle diameter
       real(c_double) :: vel(3)          !< Particle velocity
       real(c_double) :: angVel(3)       !< Angular velocity
       real(c_double) :: Acol(3)         !< Collision acceleration
       real(c_double) :: Tcol(3)         !< Collision torque
       real(c_double) :: dt              !< Particle sub-timestep
+      real(c_double) :: mass            !< Constant particle mass
+      real(c_double) :: eint            !< Specific internal energy; zero for nonthermal callers
       !> Packed id (39 bits, sign=valid) + cpu (24 bits)  [AMReX internal]
       integer(c_int64_t), private :: idcpu
       !> Extra int (NStructInt=1)
@@ -51,7 +53,10 @@ module amrlpt_class
 
    !> C interface: bind(C) declarations to amrlpt_wrapper.cpp
    interface
-
+      function amrlpt_particle_size() result(nbytes) bind(c)
+         import :: c_size_t
+         integer(c_size_t) :: nbytes
+      end function
       subroutine amrlpt_new_pc(pc, amrcore) bind(c)
          import :: c_ptr
          type(c_ptr) :: pc
@@ -242,7 +247,7 @@ module amrlpt_class
       !> Associated AMR grid
       class(amrgrid), pointer :: amr=>null()
 
-      !> AMReX NeighborParticleContainer<14,1> opaque handle
+      !> AMReX NeighborParticleContainer<16,1> opaque handle
       type(c_ptr) :: pc=c_null_ptr
 
       !> Solver name
@@ -259,7 +264,7 @@ module amrlpt_class
       integer(I8) :: np_above_maxlvl=0
 
       !> Physics parameters
-      real(WP) :: rho                                   !< Particle material density
+      real(WP) :: rho                                   !< Reference density for injection and immersed carrier fallback
       real(WP) :: gas_gamma=1.4_WP                     !< Gas specific-heat ratio used by compressible drag laws
       real(WP), dimension(3) :: gravity=0.0_WP          !< Acceleration of gravity
       integer :: nstep=1                                !< Substeps per timestep
@@ -268,6 +273,15 @@ module amrlpt_class
       !> the normal locally deposited particle VF. This is useful for isolated-particle/dilute-limit
       !> verification without changing VF deposition or two-way source transfer.
       real(WP) :: drag_vf_override=-1.0_WP
+      !> Select total-energy reaction; default retains legacy drag-dissipation source semantics.
+      logical :: total_energy_coupling=.false.
+      !> Associated EOS enables heat exchange. Diameter/mass are fixed, so thermal capacity is m*cv.
+      class(material), pointer :: heat_material=>null()
+      real(WP) :: heat_prandtl=0.71_WP
+      !> Cumulative heat returned to fluid (negative for particle heating).
+      real(WP) :: heat_exchange=0.0_WP,heat_exchange_loc=0.0_WP
+      !> Cumulative fluid impulse(3), mechanical energy, and drag-only dissipation.
+      real(WP) :: exchange(5)=0.0_WP,exchange_loc(5)=0.0_WP
 
       !> Collision parameters
       real(WP) :: tau_col=1.0e-3_WP             !< Collision time scale
@@ -298,6 +312,16 @@ module amrlpt_class
       real(WP) :: Vp_new=0.0_WP,Vp_out=0.0_WP,Vp_tot=0.0_WP
       integer  :: np_new_loc=0,np_out_loc=0
       real(WP) :: Vp_new_loc=0.0_WP,Vp_out_loc=0.0_WP
+      !> Physical particle inventory, summed over active particles by get_info.
+      real(WP) :: mass_tot=0.0_WP,kinetic_tot=0.0_WP,internal_tot=0.0_WP
+      real(WP), dimension(3) :: momentum_tot=0.0_WP
+      !> Cumulative open-boundary losses: mass, momentum(3), total energy.
+      real(WP), dimension(5) :: outflow=0.0_WP,outflow_loc=0.0_WP
+      !> Case-selected gas-free removal; legacy callers retain immersed-liquid fallback.
+      logical :: cull_gas_free=.false.
+      integer :: np_culled=0,np_culled_loc=0
+      real(WP) :: np_culled_tot=0.0_WP ! real storage for live scalar checkpoint registration
+      real(WP) :: culled(5)=0.0_WP,culled_loc(5)=0.0_WP ! mass, momentum(3), total energy
       integer  :: ncol=0
       
       !> Engulfed-particle fallback: a particle whose whole sampling stencil is pure liquid is
@@ -348,10 +372,7 @@ module amrlpt_class
       real(WP) :: VF_tag=-1.0_WP
 
       !> Two-way coupling source terms, 4 components. SIGN CONVENTION: src is what the FLUID
-      !> GAINS - 1:3 react to drag + optional resolved stress; 4 is drag dissipation delivered to the
-      !> fluid's internal energy. Values are TIME-INTEGRATED over the interval advance/advance_to
-      !> covered (impulse and energy per unit volume), not rates, so a consumer adding them to a
-      !> dQdt must divide by that interval.
+      !> GAINS - 1:3 react to drag + optional resolved stress
       type(amrdata) :: src
 
       !> Boundary condition flags for collision detection
@@ -445,6 +466,12 @@ module amrlpt_class
    end interface
 
 contains
+
+   ! IEEE binary64 exponent check remains valid under the production -ffast-math flags.
+   elemental logical function particle_finite(x) result(finite)
+      real(WP), intent(in) :: x
+      finite=iand(transfer(x,0_I8),int(z'7ff0000000000000',I8)).ne.int(z'7ff0000000000000',I8)
+   end function particle_finite
 
    ! ============================================================================
    ! DISPATCHERS (module-level) - recover concrete amrlpt type
@@ -655,6 +682,8 @@ contains
       class(amrgrid), target, intent(in) :: amr
       character(len=*), optional :: name
       real(WP), intent(in), optional :: gas_gamma
+      type(part) :: layout_probe
+      if (c_sizeof(layout_probe).ne.amrlpt_particle_size()) call die('[amrlpt initialize] Fortran/C++ particle layout size mismatch')
       ! Assign solver name
       if (present(name)) this%name=trim(adjustl(name))
       ! Store the thermodynamic property used by compressible drag correlations. Keep the
@@ -816,7 +845,7 @@ contains
 
                ! Set first particle properties
                r1=p(i1)%pos; v1=p(i1)%vel; w1=p(i1)%angVel
-               d1=p(i1)%d;   m1=this%rho*Pi/6.0_WP*d1**3
+               d1=p(i1)%d;   m1=p(i1)%mass
 
                ! Wall and IB collisions: r2=contact point, d2=0, v2=w2=0, and m2=huge so that m_eff=m1
                v2=0.0_WP; w2=0.0_WP; d2=0.0_WP; m2=huge(m1)
@@ -851,7 +880,7 @@ contains
                      if (IAND(p(j_c)%flag,PART_COLLIDES).eq.0) cycle
                      ! Set neighbor properties
                      r2=p(j_c)%pos; v2=p(j_c)%vel; w2=p(j_c)%angVel
-                     d2=p(j_c)%d;   m2=this%rho*Pi/6.0_WP*d2**3
+                     d2=p(j_c)%d;   m2=p(j_c)%mass
                      ! Compute collision force
                      call col_force(k_coeff,eta_coeff,hit)
                      if (hit) this%ncol=this%ncol+1
@@ -944,7 +973,7 @@ contains
    !> Ucomp/Vcomp/Wcomp: component to use from each velocity field (optional, default 1)
    !> rhocomp/visccomp: component to use from rho/visc fields (optional, default 1)
    !> cst_rho/cst_visc: constant scalar alternatives to rho/visc amrdata
-   subroutine advance(this,dt,U,Ucomp,V,Vcomp,W,Wcomp,rho,rhocomp,visc,visccomp,snd,sndcomp,cst_rho,cst_visc,cst_snd,stress_div)
+   subroutine advance(this,dt,U,Ucomp,V,Vcomp,W,Wcomp,rho,rhocomp,visc,visccomp,snd,sndcomp,cst_rho,cst_visc,cst_snd,stress_div,thermal)
       use amrex_amr_module, only: amrex_distromap
       use amrex_distromap_module, only: operator(.eq.)
       use amrex_interface, only: amrmfab_parallel_add
@@ -955,12 +984,12 @@ contains
       type(amrdata), intent(in) :: U,V,W
       type(amrdata), intent(in), optional :: rho,visc,snd
       ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
-      type(amrdata), intent(in), optional :: stress_div
+      type(amrdata), intent(in), optional :: stress_div,thermal
       real(WP),      intent(in), optional :: cst_rho,cst_visc,cst_snd
       integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
       type(amrex_distromap), dimension(:), allocatable :: pdms
       logical :: any_dual_dm
-      type(amrdata), allocatable :: stress_pdm
+      type(amrdata), allocatable :: stress_pdm,thermal_pdm
       type(amrdata) :: U_pdm,V_pdm,W_pdm,rho_pdm,visc_pdm,VF_pdm,src_pdm
       integer :: lvl
 
@@ -974,6 +1003,10 @@ contains
 
       ! Clone fields onto particle DMs if needed
       if (any_dual_dm) then
+         if (present(thermal)) then
+            allocate(thermal_pdm)
+            call thermal%clone(thermal_pdm,dm=pdms)
+         end if
          if (present(stress_div)) then
             allocate(stress_pdm)
             call stress_div%clone(stress_pdm,dm=pdms)
@@ -998,16 +1031,16 @@ contains
       ! Perform one step
       if (any_dual_dm) then
          if (present(rho).and.present(visc)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm,thermal=thermal_pdm)
          else if (present(rho)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm,thermal=thermal_pdm)
          else if (present(visc)) then
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm,thermal=thermal_pdm)
          else
-            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm)
+            call this%step(dt=dt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm,thermal=thermal_pdm)
          end if
       else
-         call this%step(dt=dt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div)
+         call this%step(dt=dt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div,thermal=thermal)
       end if
 
       ! Writeback src_pdm to src and clean up clones
@@ -1015,6 +1048,10 @@ contains
          do lvl=0,this%amr%clvl()
             call amrmfab_parallel_add(this%src%mf(lvl),src_pdm%mf(lvl),1,1,this%src%mf(lvl)%ncomp(),0,0,this%amr%geom(lvl))
          end do
+         if (allocated(thermal_pdm)) then
+            call thermal_pdm%finalize()
+            deallocate(thermal_pdm)
+         end if
          if (allocated(stress_pdm)) then
             call stress_pdm%finalize()
             deallocate(stress_pdm)
@@ -1063,7 +1100,7 @@ contains
    !> Advance particles to a target time using CFL-limited sub-steps:
    !> Sub-step size is adapted from this%dt (persistent) using this%cflmax
    !> On exit, this%t=t_target and this%dt holds the last adapted sub-step
-   subroutine advance_to(this,time,do_collide,U,V,W,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,Gib,Gibcomp,stress_div,gas_fraction)
+   subroutine advance_to(this,time,do_collide,U,V,W,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,Gib,Gibcomp,stress_div,gas_fraction,thermal)
       use amrex_amr_module, only: amrex_distromap
       use amrex_distromap_module, only: operator(.eq.)
       use amrex_interface, only: amrmfab_parallel_add
@@ -1075,7 +1112,7 @@ contains
       type(amrdata), intent(in) :: U,V,W
       type(amrdata), intent(in), optional :: rho,visc,snd
       ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
-      type(amrdata), intent(in), optional :: stress_div
+      type(amrdata), intent(in), optional :: stress_div,thermal
       real(WP),      intent(in), optional :: cst_rho,cst_visc,cst_snd
       integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
       type(amrdata), intent(in), optional :: Gib
@@ -1086,7 +1123,7 @@ contains
       integer  :: n_sub,lvl
       type(amrex_distromap), dimension(:), allocatable :: pdms
       logical :: any_dual_dm
-      type(amrdata), allocatable :: stress_pdm
+      type(amrdata), allocatable :: stress_pdm,thermal_pdm
       type(amrdata) :: U_pdm,V_pdm,W_pdm,rho_pdm,visc_pdm,Gib_pdm,VF_pdm,src_pdm
 
       ! Validate time target
@@ -1108,6 +1145,10 @@ contains
       if (any_dual_dm.and.present(gas_fraction)) &
       & call die('[amrlpt advance_to] gas-fraction sampling requires the fluid particle DistributionMapping')
       if (any_dual_dm) then
+         if (present(thermal)) then
+            allocate(thermal_pdm)
+            call thermal%clone(thermal_pdm,dm=pdms)
+         end if
          if (present(stress_div)) then
             allocate(stress_pdm)
             call stress_div%clone(stress_pdm,dm=pdms)
@@ -1150,16 +1191,16 @@ contains
          ! Step particles
          if (any_dual_dm) then
             if (present(rho).and.present(visc)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,visc=visc_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,stress_div=stress_pdm,thermal=thermal_pdm)
             else if (present(rho)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,rho=rho_pdm,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,stress_div=stress_pdm,thermal=thermal_pdm)
             else if (present(visc)) then
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,visc=visc_pdm,cst_rho=cst_rho,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,visccomp=visccomp,stress_div=stress_pdm,thermal=thermal_pdm)
             else
-               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm)
+               call this%step(dt=mydt,U=U_pdm,V=V_pdm,W=W_pdm,VF=VF_pdm,src=src_pdm,cst_rho=cst_rho,cst_visc=cst_visc,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,stress_div=stress_pdm,thermal=thermal_pdm)
             end if
          else
-            call this%step(dt=mydt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div,gas_fraction=gas_fraction)
+            call this%step(dt=mydt,U=U,V=V,W=W,VF=this%VF,src=this%src,rho=rho,visc=visc,snd=snd,cst_rho=cst_rho,cst_visc=cst_visc,cst_snd=cst_snd,Ucomp=Ucomp,Vcomp=Vcomp,Wcomp=Wcomp,rhocomp=rhocomp,visccomp=visccomp,sndcomp=sndcomp,stress_div=stress_div,gas_fraction=gas_fraction,thermal=thermal)
          end if
          ! Increment time and sub-step counter
          dt_done=dt_done+mydt; n_sub=n_sub+1
@@ -1170,6 +1211,10 @@ contains
          do lvl=0,this%amr%clvl()
             call amrmfab_parallel_add(this%src%mf(lvl),src_pdm%mf(lvl),1,1,this%src%mf(lvl)%ncomp(),0,0,this%amr%geom(lvl))
          end do
+         if (allocated(thermal_pdm)) then
+            call thermal_pdm%finalize()
+            deallocate(thermal_pdm)
+         end if
          if (allocated(stress_pdm)) then
             call stress_pdm%finalize()
             deallocate(stress_pdm)
@@ -1237,7 +1282,7 @@ contains
 
    !> Step all particles on all AMR levels by dt, deposit momentum source
    !> All amrdata arguments must be on the particle DM (caller ensures via clone)
-   subroutine step(this,dt,U,V,W,VF,src,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,stress_div,gas_fraction)
+   subroutine step(this,dt,U,V,W,VF,src,rho,visc,snd,cst_rho,cst_visc,cst_snd,Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp,stress_div,gas_fraction,thermal)
       use amrex_amr_module, only: amrex_mfiter,amrex_mfiter_build,amrex_mfiter_destroy
       use mathtools, only: Pi
       use messager,  only: die
@@ -1245,7 +1290,7 @@ contains
       class(amrlpt), intent(inout) :: this
       real(WP), intent(in) :: dt
       type(amrdata), intent(in) :: U,V,W,VF
-      type(amrdata), intent(in), optional :: gas_fraction
+      type(amrdata), intent(in), optional :: gas_fraction,thermal
       type(amrdata), intent(inout) :: src
       type(amrdata), intent(in), optional :: rho,visc,snd
       ! Resolved stress divergence (force/volume), cell-centered components x,y,z.
@@ -1254,7 +1299,7 @@ contains
       integer,       intent(in), optional :: Ucomp,Vcomp,Wcomp,rhocomp,visccomp,sndcomp
 
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pRho,pVisc,pSnd,pVolFrac,pSrc,pStress,pGasFraction
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pRho,pVisc,pSnd,pVolFrac,pSrc,pStress,pGasFraction,pThermal
       type(amrex_mfiter) :: mfi
       type(part), dimension(:), pointer :: p
       integer(I8) :: np_
@@ -1265,10 +1310,23 @@ contains
       !> heating uses drag alone even when acc also includes resolved stress.
       real(WP), dimension(3) :: vrel
       real(WP), dimension(4) :: dsrc
-      type(part) :: myp,pold
+      type(part), target :: myp
+      type(part) :: pold
       logical :: is_stag
-      logical :: immersed_this_particle,immersed_now
-      integer :: nsub_p
+      logical :: immersed_this_particle,immersed_now,no_gas
+      integer :: nsub_p,nretry
+      real(WP) :: dedt,thermal_dt,dheat,Tcheck
+      logical :: heat_enabled
+
+      if (this%cull_gas_free.and..not.present(gas_fraction)) call die('[amrlpt step] gas-free culling requires gas_fraction')
+      heat_enabled=associated(this%heat_material)
+      if (heat_enabled.neqv.present(thermal)) call die('[amrlpt heat] supply both heat_material and thermal field')
+      if (heat_enabled) then
+         if (.not.this%total_energy_coupling) call die('[amrlpt heat] requires total-energy coupling')
+         if (.not.particle_finite(this%heat_prandtl).or.this%heat_prandtl.le.0.0_WP) call die('[amrlpt heat] invalid Prandtl number')
+         if (thermal%ncomp.ne.2.or.any(thermal%nodal).or.thermal%ng.lt.this%nover) &
+            call die('[amrlpt heat] thermal field requires cell-centered temperature/conductivity and particle ghosts')
+      end if
 
       ! Start step timer
       call this%tmr_step%start()
@@ -1334,6 +1392,7 @@ contains
             if (present(snd))  pSnd =>snd%mf(lvl)%dataptr(mfi)
             if (present(stress_div)) pStress=>stress_div%mf(lvl)%dataptr(mfi)
             if (present(gas_fraction)) pGasFraction=>gas_fraction%mf(lvl)%dataptr(mfi)
+            if (heat_enabled) pThermal=>thermal%mf(lvl)%dataptr(mfi)
             pVolFrac=>VF%mf(lvl)%dataptr(mfi)
             pSrc    =>src%mf(lvl)%dataptr(mfi)
 
@@ -1346,13 +1405,15 @@ contains
                if (IAND(p(i)%flag,PART_MOVES+PART_EXCHANGES).eq.0) cycle
                ! Create copy of particle
                myp=p(i)
-               immersed_this_particle=.false.
+               immersed_this_particle=.false.; no_gas=.false.
                ! Time-integrate until dt_done=dt
                dt_done=0.0_WP; nsub_p=0
                do while (dt_done.lt.dt)
                   mydt=min(myp%dt,dt-dt_done)
                   if (mydt.le.0.0_WP) mydt=dt-dt_done
                   nsub_p=nsub_p+1
+                  if (heat_enabled.and.nsub_p.ge.this%nsub_max) &
+                     call die('[amrlpt heat] particle substep limit reached; increase nsub_max or reduce flow timestep')
                   if (nsub_p.ge.this%nsub_max) then                ! <-- add: backstop
                      mydt=dt-dt_done
                      this%np_substep_capped_loc=this%np_substep_capped_loc+1
@@ -1362,18 +1423,53 @@ contains
                   pold=myp
                   ! Precompute moment of inertia for a sphere
                   Ip=0.1_WP*myp%d**2
-                  ! Advance with Euler prediction
-                  acc=get_rhs()
-                  if (IAND(myp%flag,PART_MOVES).ne.0) then
-                     myp%pos=pold%pos+0.5_WP*mydt*myp%vel
-                     myp%vel=pold%vel+0.5_WP*mydt*(acc+this%gravity+myp%Acol)
-                     myp%angVel=pold%angVel+0.5_WP*mydt*myp%Tcol/Ip
-                  end if
-                  acc=get_rhs()
-                  if (IAND(myp%flag,PART_MOVES).ne.0) then
-                     myp%pos=pold%pos+mydt*myp%vel
-                     myp%vel=pold%vel+mydt*(acc+this%gravity+myp%Acol)
-                     myp%angVel=pold%angVel+mydt*myp%Tcol/Ip
+                  ! Existing explicit midpoint stages, extended to internal energy. Retry only
+                  ! an unaccepted trial if the midpoint thermal time becomes more restrictive.
+                  nretry=0
+                  do
+                     nretry=nretry+1
+                     if (nretry.gt.50) call die('[amrlpt heat] failed to find a valid thermal substep')
+                     myp=pold
+                     acc=get_rhs()
+                     if (no_gas) exit
+                     if (heat_enabled) mydt=min(mydt,0.5_WP*thermal_dt)
+                     if (dt_done+mydt.le.dt_done) call die('[amrlpt step] substep underflow')
+                     if (heat_enabled) myp%eint=pold%eint+0.5_WP*mydt*dedt
+                     if (IAND(myp%flag,PART_MOVES).ne.0) then
+                        myp%pos=pold%pos+0.5_WP*mydt*myp%vel
+                        myp%vel=pold%vel+0.5_WP*mydt*(acc+this%gravity+myp%Acol)
+                        myp%angVel=pold%angVel+0.5_WP*mydt*myp%Tcol/Ip
+                     end if
+                     acc=get_rhs()
+                     if (no_gas) exit
+                     if (heat_enabled) then
+                        if (mydt.gt.0.5_WP*thermal_dt*(1.0_WP+1.0e-12_WP)) then
+                           mydt=0.5_WP*thermal_dt
+                           cycle
+                        end if
+                        myp%eint=pold%eint+mydt*dedt
+                        Tcheck=this%heat_material%get_T_from_rho_e(rho=myp%mass/(Pi/6.0_WP*myp%d**3),e=myp%eint,y=[1.0_WP])
+                        if (.not.particle_finite(Tcheck).or.Tcheck.le.0.0_WP.or..not.particle_finite(myp%eint)) then
+                           mydt=0.5_WP*mydt
+                           cycle
+                        end if
+                     end if
+                     if (IAND(myp%flag,PART_MOVES).ne.0) then
+                        myp%pos=pold%pos+mydt*myp%vel
+                        myp%vel=pold%vel+mydt*(acc+this%gravity+myp%Acol)
+                        myp%angVel=pold%angVel+mydt*myp%Tcol/Ip
+                     end if
+                     exit
+                  end do
+
+                  if (no_gas) then
+                     ! Discard the trial at either stage; retain all previously accepted deposits.
+                     myp=pold
+                     this%np_culled_loc=this%np_culled_loc+1
+                     this%culled_loc=this%culled_loc+[myp%mass,myp%mass*myp%vel, &
+                        myp%mass*(myp%eint+0.5_WP*dot_product(myp%vel,myp%vel))]
+                     call amrlpt_set_particle_id(-1_c_int64_t,c_loc(myp))
+                     exit
                   end if
 
                   ! Catch a particle that has left its deposit stencil (or gone NaN) within one
@@ -1392,35 +1488,30 @@ contains
                      call die('[amrlpt step] particle left its deposit stencil in one sub-step - tighten cflmax/dtmax')
                   end if
 
-                  ! Transfer back to the mesh. src is what the FLUID gains: minus the impulse the
-                  ! particle took (drag + resolved stress), plus drag-only dissipation. Component 4 is
-                  ! mydt*mp*|vrel|^2/tau. As in shock_droplet, no separate resolved-stress
-                  ! work correction is supplied; this is not an exact total-energy closure.
+                  ! Hydrodynamic reaction only: gravity and contact forces are external to the fluid.
                   if (IAND(myp%flag,PART_EXCHANGES).ne.0) then
-                     dmom=mydt*acc*this%rho*Pi/6.0_WP*myp%d**3
+                     dmom=mydt*acc*myp%mass
                      dsrc(1:3)=-dmom
-                     dmom_drag=mydt*acc_drag*this%rho*Pi/6.0_WP*myp%d**3
-                     dsrc(4)  =dot_product(dmom_drag,vrel)
-                     if (immersed_now) then                        ! <-- add
-                        ! src(4) feeds the GAS internal energy. A pure-liquid cell holds
-                        ! essentially none, so this deposit would blow up IG and TG. Ledger it
-                        ! instead. Momentum still goes to Q(5:7), the mixture momentum, which is
-                        ! the liquid's here, so that exchange stays exact.
+                     dmom_drag=mydt*acc_drag*myp%mass
+                     dsrc(4)=dot_product(dmom_drag,vrel)
+                     this%exchange_loc(1:3)=this%exchange_loc(1:3)+dsrc(1:3)
+                     this%exchange_loc(5)=this%exchange_loc(5)+dsrc(4)
+                     if (this%total_energy_coupling) then
+                        ! Endpoint-average velocity gives exact hydrodynamic work in the discrete
+                        ! kinetic-energy balance, including when gravity/contact also change velocity.
+                        ! A prescribed nonmoving particle keeps its velocity: this is support work,
+                        ! not a change of particle KE (zero work for a stationary supported particle).
+                        dsrc(4)=-dot_product(0.5_WP*(pold%vel+myp%vel),dmom)
+                        this%exchange_loc(4)=this%exchange_loc(4)+dsrc(4)
+                     else if (immersed_now) then
+                        ! Legacy gas-internal-energy callers cannot heat an absent gas phase.
                         this%E_immersed_loc=this%E_immersed_loc+dsrc(4)
                         dsrc(4)=0.0_WP
                      end if
-                     ! THERMAL COUPLING (disabled): convective heat transfer would subtract the
-                     ! heat the drop absorbs, dsrc(4)=dsrc(4)-mydt*mp*this%Cp*dTdt, with dTdt from
-                     ! a Gunn (1978) Nusselt correlation in get_rhs. Enabling it needs a particle
-                     ! temperature, i.e. Particle<14,1> -> <15,1>, which must move in lockstep:
-                     !   * AMRLPT_NREAL here, and the #define in amrlpt_wrapper.cpp
-                     !   * the part struct (append T after dt, before idcpu)
-                     !   * the plotfile name list in amrlpt_wrapper.cpp (NOT 't*' - taken by torque)
-                     !   * a select_comp case in amrlptviz_class.f90 (it has no case default, so a
-                     !     typo there fails silently)
-                     !   * every site that builds a pnew array must set the new field
-                     ! Existing particle checkpoints become unreadable. Add a static_assert on
-                     ! sizeof(PT) next to 'using PT' at the same time - there is no size handshake.
+                     ! Book the actual accepted internal-energy increment, including roundoff.
+                     dheat=myp%mass*(myp%eint-pold%eint)
+                     dsrc(4)=dsrc(4)-dheat
+                     this%heat_exchange_loc=this%heat_exchange_loc-dheat
                      call deposit(val=dsrc)
                   end if
                   ! Increment
@@ -1429,11 +1520,15 @@ contains
                ! Count the particle once if it was engulfed at any point this step   <-- add
                if (immersed_this_particle) this%np_immersed_loc=this%np_immersed_loc+1
                ! Track escape from non-periodic boundaries
-               if ((.not.this%amr%xper.and.(myp%pos(1).lt.this%amr%xlo.or.myp%pos(1).gt.this%amr%xhi)).or. &
-               &   (.not.this%amr%yper.and.(myp%pos(2).lt.this%amr%ylo.or.myp%pos(2).gt.this%amr%yhi)).or. &
-               &   (.not.this%amr%zper.and.(myp%pos(3).lt.this%amr%zlo.or.myp%pos(3).gt.this%amr%zhi))) then
-                  this%np_out_loc=this%np_out_loc+1
-                  this%Vp_out_loc=this%Vp_out_loc+Pi/6.0_WP*myp%d**3
+               if (.not.no_gas) then
+                  if ((.not.this%amr%xper.and.(myp%pos(1).lt.this%amr%xlo.or.myp%pos(1).gt.this%amr%xhi)).or. &
+                  &   (.not.this%amr%yper.and.(myp%pos(2).lt.this%amr%ylo.or.myp%pos(2).gt.this%amr%yhi)).or. &
+                  &   (.not.this%amr%zper.and.(myp%pos(3).lt.this%amr%zlo.or.myp%pos(3).gt.this%amr%zhi))) then
+                     this%np_out_loc=this%np_out_loc+1
+                     this%Vp_out_loc=this%Vp_out_loc+Pi/6.0_WP*myp%d**3
+                     this%outflow_loc=this%outflow_loc+[myp%mass,myp%mass*myp%vel, &
+                        myp%mass*(myp%eint+0.5_WP*dot_product(myp%vel,myp%vel))]
+                  end if
                end if
                ! Write back
                p(i)=myp
@@ -1458,11 +1553,14 @@ contains
          real(WP), dimension(3) :: acc,fvel
          integer :: c
          real(WP), dimension(30) :: diag_record
-         real(WP) :: pVF,fVF,frho,fvisc,fC,Re,tau,corr,b1,b2,diag_Re,diag_Ma,diag_Kn
+         real(WP) :: pVF,fVF,frho,fvisc,fC,Re,tau,corr,b1,b2,diag_Re,diag_Ma,diag_Kn,rho_p
+         real(WP) :: Tg,kg,Tp,cvp,Nu,H,Reheat
          real(WP) :: wx,wy,wz,fx,fy,fz
-         real(WP) :: gas_weights(0:1,0:1,0:1),gas_sum
+         real(WP) :: gas_weights(0:1,0:1,0:1),gas_sum,gas_scale
          integer :: a,b,cg
          integer  :: ic,jc,kc,ix,iy,iz
+         dedt=0.0_WP; thermal_dt=huge(1.0_WP); no_gas=.false.
+         rho_p=myp%mass/(Pi/6.0_WP*myp%d**3)
          ! Cell-centered stencil indices and weights
          ic=floor((myp%pos(1)-this%amr%xlo)*dxi-0.5_WP); wx=(myp%pos(1)-this%amr%xlo)*dxi-0.5_WP-real(ic,WP)
          jc=floor((myp%pos(2)-this%amr%ylo)*dyi-0.5_WP); wy=(myp%pos(2)-this%amr%ylo)*dyi-0.5_WP-real(jc,WP)
@@ -1502,23 +1600,32 @@ contains
          end if
          ! Gas properties must not be diluted by zero-valued pure-liquid entries. Keep the
          ! ordinary interpolation unchanged for callers that do not supply a gas fraction.
+         do cg=0,1; do b=0,1; do a=0,1
+            gas_weights(a,b,cg)=merge(wx,1.0_WP-wx,a.eq.1)*merge(wy,1.0_WP-wy,b.eq.1)*merge(wz,1.0_WP-wz,cg.eq.1)
+         end do; end do; end do
          if (present(gas_fraction)) then
-            do cg=0,1; do b=0,1; do a=0,1
-               gas_weights(a,b,cg)=merge(wx,1.0_WP-wx,a.eq.1)*merge(wy,1.0_WP-wy,b.eq.1) &
-               & *merge(wz,1.0_WP-wz,cg.eq.1)*pGasFraction(ic+a,jc+b,kc+cg,1)
-            end do; end do; end do
-            !gas_sum=sum(gas_weights)
-            !if (.not.(gas_sum.gt.0.0_WP)) call die('[amrlpt step] particle sampling stencil contains no valid gas')
-            !gas_weights=gas_weights/gas_sum
+            if (.not.all(particle_finite(pGasFraction(ic:ic+1,jc:jc+1,kc:kc+1,1))).or. &
+                minval(pGasFraction(ic:ic+1,jc:jc+1,kc:kc+1,1)).lt.0.0_WP) &
+               call die('[amrlpt step] invalid gas sampling fraction')
+            ! Scale before multiplying: retain tiny positive fractions without an absolute cutoff.
+            gas_scale=maxval(pGasFraction(ic:ic+1,jc:jc+1,kc:kc+1,1),mask=gas_weights.gt.0.0_WP)
+            if (gas_scale.gt.0.0_WP) then
+               do cg=0,1; do b=0,1; do a=0,1
+                  if (gas_weights(a,b,cg).gt.0.0_WP) &
+                     gas_weights(a,b,cg)=gas_weights(a,b,cg)*(pGasFraction(ic+a,jc+b,kc+cg,1)/gas_scale)
+               end do; end do; end do
+            else
+               gas_weights=0.0_WP
+            end if
             gas_sum=sum(gas_weights)
             if (.not.(gas_sum.gt.0.0_WP)) then
+               if (this%cull_gas_free) then
+                  no_gas=.true.; acc=0.0_WP
+                  return
+               end if
                ! ENGULFED: the whole stencil is pure liquid, so there is no gas state to build a
                ! drag law from. The particle is made of the same liquid that surrounds it, so it
-               ! is neutrally buoyant: use the liquid's own density and viscosity in a
-               ! Schiller-Naumann law (Osnes is a compressible GAS correlation and its Mach number
-               ! would be meaningless here). tau is physical and dt-independent, and far above the
-               ! flow step, so this cannot drive the sub-step loop. The resolved stress term below
-               ! is the local liquid acceleration, since rho_p = rho_liquid.
+               ! is neutrally buoyant: use the liquid's own density and viscosity in a Schiller-Naumann law 
                if (this%visc_immersed.le.0.0_WP) &
                &   call die('[amrlpt step] engulfed particle needs visc_immersed (liquid dynamic viscosity)')
                immersed_now=.true.
@@ -1527,12 +1634,12 @@ contains
                vrel =fvel-myp%vel
                Re   =frho*norm2(vrel)*myp%d/fvisc+epsilon(1.0_WP)
                corr =1.0_WP+0.15_WP*Re**(0.687_WP)
-               tau  =this%rho*myp%d**2/(18.0_WP*fvisc*corr)
+               tau  =rho_p*myp%d**2/(18.0_WP*fvisc*corr)
                acc_drag=vrel/tau
                acc  =acc_drag
                if (present(stress_div)) then
                   do c=1,3
-                     acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/this%rho
+                     acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/rho_p
                   end do
                end if
                myp%dt=tau/real(this%nstep,WP)
@@ -1559,6 +1666,26 @@ contains
             if (.not.present(cst_rho)) frho=sum(gas_weights*pRho(ic:ic+1,jc:jc+1,kc:kc+1,rhoc))
             if (.not.present(cst_visc)) fvisc=sum(gas_weights*pVisc(ic:ic+1,jc:jc+1,kc:kc+1,viscc))+epsilon(1.0_WP)
             if (present(snd).and..not.present(cst_snd)) fC=sum(gas_weights*pSnd(ic:ic+1,jc:jc+1,kc:kc+1,sndc))
+         end if
+         if (heat_enabled.and.IAND(myp%flag,PART_EXCHANGES).ne.0) then
+            Tg=sum(gas_weights*pThermal(ic:ic+1,jc:jc+1,kc:kc+1,1))
+            kg=sum(gas_weights*pThermal(ic:ic+1,jc:jc+1,kc:kc+1,2))
+            Tp=this%heat_material%get_T_from_rho_e(rho=rho_p,e=myp%eint,y=[1.0_WP])
+            cvp=this%heat_material%get_cv_from_rho_e(rho=rho_p,e=myp%eint,y=[1.0_WP])
+            if (.not.all(particle_finite([Tg,kg,Tp,cvp,frho,fvisc])).or.min(Tg,Tp,cvp,frho,fvisc).le.0.0_WP.or.kg.lt.0.0_WP) &
+               call die('[amrlpt heat] invalid sampled gas properties or particle thermal state')
+            ! Gunn (1978), isolated-particle porosity=1, independently of Eulerian gas fraction.
+            Reheat=frho*norm2(fvel-myp%vel)*myp%d/fvisc
+            Nu=2.0_WP*(1.0_WP+0.7_WP*Reheat**0.2_WP*this%heat_prandtl**(1.0_WP/3.0_WP)) &
+               +0.13_WP*Reheat**0.7_WP*this%heat_prandtl**(1.0_WP/3.0_WP)
+            H=Pi*myp%d*kg*Nu ! h*A = (Nu*k/d)*(pi*d^2)
+            if (.not.particle_finite(H)) call die('[amrlpt heat] non-finite heat conductance')
+            if (H.gt.0.0_WP) then
+               dedt=H*(Tg-Tp)/myp%mass
+               thermal_dt=myp%mass*cvp/H
+               if (.not.particle_finite(dedt).or..not.particle_finite(thermal_dt).or.thermal_dt.le.0.0_WP) &
+                  call die('[amrlpt heat] invalid heat rate or response time')
+            end if
          end if
          fC=fC+epsilon(1.0_WP)
          ! Volume fraction
@@ -1655,7 +1782,7 @@ contains
             corr=1.0_WP
          end select
          ! Particle response time
-         tau=this%rho*myp%d**2/(18.0_WP*fvisc*corr)
+         tau=rho_p*myp%d**2/(18.0_WP*fvisc*corr)
          ! Return acceleration and update particle timestep size. vrel is handed back to step
          ! by host association so the dissipation it deposits matches this acc exactly.
          vrel=fvel-myp%vel
@@ -1663,10 +1790,11 @@ contains
          acc=acc_drag
          if (present(stress_div)) then
             do c=1,3
-               acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/this%rho
+               acc(c)=acc(c)+this%interp(lvl,myp%pos,pStress,c)/rho_p
             end do
          end if
          myp%dt=tau/real(this%nstep,WP)
+         if (heat_enabled) myp%dt=min(myp%dt,0.5_WP*thermal_dt)
          ! Save co-located inputs for the local Re/Ma/Kn extrema. get_info identifies the global
          ! winners and prints only those records in MPI-rank order, avoiding interleaved traces.
          if (trim(this%drag_model).eq.'Osnes') then
@@ -2326,16 +2454,31 @@ contains
    !> Append a Fortran part array to the particle container (collective)
    subroutine append(this,pnew,n)
       use messager, only: die
+      use mpi_f08, only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_MAX,MPI_INTEGER
       implicit none
       class(amrlpt), intent(inout) :: this
       type(part), dimension(:), allocatable, target, intent(in) :: pnew
       integer(I8), intent(in) :: n
       type(c_ptr) :: raw
-      raw=c_null_ptr
-      if (n.gt.0_I8.and.allocated(pnew)) then
-         if (int(size(pnew),I8).lt.n) call die('[amrlpt append] pnew array smaller than n')
-         raw=c_loc(pnew(1))
+      integer :: bad,ierr
+      integer(I8) :: i
+      raw=c_null_ptr; bad=0
+      if (n.lt.0_I8) bad=1
+      if (n.gt.0_I8) then
+         if (.not.allocated(pnew)) then
+            bad=1
+         else if (int(size(pnew),I8).lt.n) then
+            bad=1
+         else
+            do i=1,n
+               if (.not.all(particle_finite([pnew(i)%d,pnew(i)%mass,pnew(i)%eint,pnew(i)%vel]))) bad=1
+               if (pnew(i)%d.le.0.0_WP.or.pnew(i)%mass.le.0.0_WP) bad=1
+            end do
+            raw=c_loc(pnew(1))
+         end if
       end if
+      call MPI_ALLREDUCE(MPI_IN_PLACE,bad,1,MPI_INTEGER,MPI_MAX,this%amr%comm,ierr)
+      if (bad.ne.0) call die('[amrlpt append] invalid array or particle payload: require finite velocity/eint and positive finite diameter/mass')
       call amrlpt_append_particles(this%pc,raw,int(n,c_int64_t))
    end subroutine append
 
@@ -2416,7 +2559,9 @@ contains
       integer(I8) :: np_
       integer :: lvl,n,i,j,k,ierr
       real(WP) :: d_sum,d_sq,vx_sum,vx_sq,vy_sum,vy_sq,vz_sum,vz_sq,inv_np,re_loc,ma_loc,kn_loc
+      real(WP) :: inventory(6)
       ! Init per-rank accumulators
+      inventory=0.0_WP
       this%np=0; this%Vp_tot=0.0_WP
       this%dmin=huge(1.0_WP); this%dmax=-huge(1.0_WP);  d_sum=0.0_WP;  d_sq=0.0_WP
       this%Umin=huge(1.0_WP); this%Umax=-huge(1.0_WP); vx_sum=0.0_WP; vx_sq=0.0_WP
@@ -2431,6 +2576,8 @@ contains
                if (p(n)%flag.eq.PART_IS_DEAD) cycle
                this%np=this%np+1
                this%Vp_tot=this%Vp_tot+Pi/6.0_WP*p(n)%d**3
+               inventory=inventory+[p(n)%mass,p(n)%mass*p(n)%vel, &
+                  0.5_WP*p(n)%mass*dot_product(p(n)%vel,p(n)%vel),p(n)%mass*p(n)%eint]
                this%dmin=min(this%dmin,p(n)%d);      this%dmax=max(this%dmax,p(n)%d);       d_sum= d_sum+p(n)%d;       d_sq= d_sq+p(n)%d**2
                this%Umin=min(this%Umin,p(n)%vel(1)); this%Umax=max(this%Umax,p(n)%vel(1)); vx_sum=vx_sum+p(n)%vel(1); vx_sq=vx_sq+p(n)%vel(1)**2
                this%Vmin=min(this%Vmin,p(n)%vel(2)); this%Vmax=max(this%Vmax,p(n)%vel(2)); vy_sum=vy_sum+p(n)%vel(2); vy_sq=vy_sq+p(n)%vel(2)**2
@@ -2445,6 +2592,9 @@ contains
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%np_max,1,MPI_INTEGER8,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%np,    1,MPI_INTEGER8,MPI_SUM,this%amr%comm,ierr)
       if (this%np_max.gt.0) this%np_eff=real(this%np,WP)/real(this%np_max,WP)/real(this%amr%nproc,WP)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,inventory,6,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+      this%mass_tot=inventory(1); this%momentum_tot=inventory(2:4)
+      this%kinetic_tot=inventory(5); this%internal_tot=inventory(6)
       ! Reduce other statistics
       re_loc=this%Remax; ma_loc=this%Mamax; kn_loc=this%Knmax
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%Remax, 1,MPI_REAL_WP ,MPI_MAX,this%amr%comm,ierr)
@@ -2558,6 +2708,17 @@ contains
 
       ! Reduce local accumulators, publish to monitoring fields, then zero for next interval
       reduce_local_stats: block
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%culled_loc,5,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+         this%culled=this%culled+this%culled_loc; this%culled_loc=0.0_WP
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%np_culled_loc,1,MPI_INTEGER,MPI_SUM,this%amr%comm,ierr)
+         this%np_culled=this%np_culled_loc; this%np_culled_tot=this%np_culled_tot+this%np_culled_loc
+         this%np_culled_loc=0
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%heat_exchange_loc,1,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+         this%heat_exchange=this%heat_exchange+this%heat_exchange_loc; this%heat_exchange_loc=0.0_WP
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%exchange_loc,5,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+         this%exchange=this%exchange+this%exchange_loc; this%exchange_loc=0.0_WP
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%outflow_loc,5,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+         this%outflow=this%outflow+this%outflow_loc; this%outflow_loc=0.0_WP
          call MPI_ALLREDUCE(MPI_IN_PLACE,this%np_out_loc,1,MPI_INTEGER,MPI_SUM,this%amr%comm,ierr)
          call MPI_ALLREDUCE(MPI_IN_PLACE,this%Vp_out_loc,1,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
          call MPI_ALLREDUCE(MPI_IN_PLACE,this%np_new_loc,1,MPI_INTEGER,MPI_SUM,this%amr%comm,ierr)
@@ -2602,6 +2763,19 @@ contains
       call log(trim(message))
       write(message,'("  Drag model        : ",a)') trim(this%drag_model)
       call log(trim(message))
+      if (this%drag_vf_override.ge.0.0_WP) then
+         write(message,'("  Drag VF override  : ",ES12.5)') this%drag_vf_override
+         call log(trim(message))
+      else
+         call log('  Drag VF           : locally deposited particle fraction')
+      end if
+      if (this%total_energy_coupling) then
+         call log('  Energy source     : total energy (mechanical + accepted heat)')
+      else
+         call log('  Energy source     : legacy drag dissipation')
+      end if
+      if (this%cull_gas_free) call log('  Gas-free stencil  : cull last accepted state; book mass/momentum/energy loss')
+      if (associated(this%heat_material)) call log('  Particle heat     : Gunn, porosity=1, EOS internal energy, dt <= tau_T/2')
       write(message,'("  Gas gamma         : ",ES12.5)') this%gas_gamma
       call log(trim(message))
       write(message,'("  ODE substeps      : ",i0)') this%nstep

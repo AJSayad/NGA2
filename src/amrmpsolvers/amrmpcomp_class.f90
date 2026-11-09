@@ -14,9 +14,10 @@ module amrmpcomp_class
    ! Expose type and constants
    public :: amrmpcomp,VFlo,VFhi,BC_LIQ,BC_GAS,BC_REFLECT,BC_USER
 
-   ! Semi-Lagrangian face flux components: phasic Q (1:4) and CTU donor moments (5:16) sum(m*u_a(b)) and
-   ! sum(m*u_a(b+e_a)) per phase and momentum axis
-   integer, parameter :: nSLF=16
+   ! Semi-Lagrangian face flux components: phasic Q (1:4), CTU donor moments (5:16) sum(m*u_a(b)) and
+   ! sum(m*u_a(b+e_a)) per phase and momentum axis, and the gas isentrope sum (17) of the sliver step
+   integer, parameter :: nSLF=17
+   integer, parameter :: isl=17
 
    ! Unit vectors
    integer, dimension(3,3), parameter :: eu=reshape([1,0,0,0,1,0,0,0,1],[3,3])
@@ -28,7 +29,7 @@ module amrmpcomp_class
 
    !> Diagnostic counts and bookings of the last get_dQdt, get_energy, and apply_relax calls
    type :: diag_counts
-      real(WP) :: nvf_guard=0.0_WP,nsliver=0.0_WP,nrelax_fail=0.0_WP,ngate=0.0_WP
+      real(WP) :: nvf_guard=0.0_WP,nsliver=0.0_WP,nrelax_fail=0.0_WP,ngate=0.0_WP,ngate_floor=0.0_WP
       real(WP) :: gate_mass=0.0_WP,gate_energy=0.0_WP,gate_rhoU=0.0_WP,gate_rhoV=0.0_WP,gate_rhoW=0.0_WP
    end type diag_counts
 
@@ -91,10 +92,17 @@ module amrmpcomp_class
       type(amrex_multifab), dimension(3) :: SLV                       !< Band face volume moment fluxes (finest level)
       type(amrex_multifab) :: curvold,SDold                           !< Start-of-step curvature and surface density (finest level)
       type(amrex_multifab), dimension(3) :: Pj                        !< Surface tension pressure jump to add to -grad(P) on faces (finest level)
+      type(amrex_multifab), dimension(:), allocatable :: newcell      !< Cells a regrid created at each level (1) or kept (0), between on_remake/on_coarse and post_regrid
+      logical, dimension(:), allocatable :: has_newcell               !< Whether newcell is built at that level
 
       ! Band momentum flux and sliver parameters
       real(WP) :: alpha_ctu=0.5_WP       !< Staggered phase fraction below which CTU is used
       real(WP) :: sliver_frac=1.0e-2_WP  !< Transported gas fraction below which a mixed cell is equilibrated before the energy pass
+
+      ! Relaxation and positivity gate parameters
+      real(WP) :: rhoG_min=0.0_WP        !< Gas density below which a relaxation result is refused (0: off)
+      real(WP) :: TminL=0.0_WP           !< Liquid temperature floor of the positivity gate (0: undeclared)
+      real(WP) :: TminG=0.0_WP           !< Gas temperature floor of the positivity gate (0: undeclared)
 
       ! CFL numbers
       real(WP) :: CFLp=0.0_WP                                !< Pressure+convection
@@ -116,6 +124,7 @@ module amrmpcomp_class
       real(WP) :: nrelax_fail=0.0_WP             !< Mixed cells whose relaxation did not return RELAX_OK in the last call
       real(WP) :: nsliver=0.0_WP                 !< Mixed cells equilibrated as slivers in the last get_energy call
       real(WP) :: ngate=0.0_WP                   !< Mixed cells that lost a phase to the positivity gate in the last apply_relax call
+      real(WP) :: ngate_floor=0.0_WP             !< Phases the positivity gate floored to their Tmin in the last apply_relax call
       real(WP) :: gate_mass=0.0_WP,gate_energy=0.0_WP                 !< Mass and total energy the gate removed in the last apply_relax call
       real(WP) :: gate_rhoU=0.0_WP,gate_rhoV=0.0_WP,gate_rhoW=0.0_WP   !< Momentum change of the faces of gated cells (velocity kept) in that call
       type(diag_counts) :: cnt                   !< This rank's values of the counts above, which get_info sums across ranks
@@ -171,6 +180,7 @@ module amrmpcomp_class
       procedure :: apply_momentum_bc         !< Recover physical boundary momentum from filled Q and velocity
       procedure :: get_momentum              !< Set momentum from face velocity on initialization and regrid only
       procedure :: get_total_energy          !< Set the phasic total energies on initialization only
+      procedure :: restrict_Q                !< Restrict Q with covered energies from restricted internal contents, then fill
       ! Physics procedures
       procedure :: get_primitive             !< Get phasic and mixture primitive variables from conserved variables
       procedure :: get_dQdt                  !< Compute dQdt and drhoUVWdt over a step
@@ -344,7 +354,7 @@ contains
    subroutine initialize(this,amr,name)
       use amrgrid_class,    only: amrgrid
       use amrex_amr_module, only: amrex_bc_foextrap
-      use amrdata_class,    only: interp_face_lin
+      use amrdata_class,    only: interp_face_lin,interp_const
       use messager,         only: die
       implicit none
       class(amrmpcomp), target, intent(inout) :: this
@@ -385,6 +395,8 @@ contains
       call this%IG%initialize   (amr,name='IG'   ,ncomp=1,ng=0         ); this%IG%parent   =>this
       call this%PL%initialize   (amr,name='PL'   ,ncomp=1,ng=this%nover_old); this%PL%parent=>this
       call this%PG%initialize   (amr,name='PG'   ,ncomp=1,ng=this%nover_old); this%PG%parent=>this
+      ! Coarse/fine ghosts and new fine cells take the coarse parent's phasic pressure (torrens)
+      this%PL%interp=interp_const; this%PG%interp=interp_const
       call this%PLold%initialize  (amr,name='PLold'  ,ncomp=1,ng=this%nover_old); this%PLold%parent  =>this
       call this%PGold%initialize  (amr,name='PGold'  ,ncomp=1,ng=this%nover_old); this%PGold%parent  =>this
       call this%TL%initialize   (amr,name='TL'   ,ncomp=1,ng=1         ); this%TL%parent   =>this
@@ -416,6 +428,7 @@ contains
 
       ! Allocate per-level flux workspaces (built in reset_fields when levels are created or remade)
       allocate(this%Fx (0:amr%maxlvl),this%Fy (0:amr%maxlvl),this%Fz (0:amr%maxlvl))
+      allocate(this%newcell(0:amr%maxlvl),this%has_newcell(0:amr%maxlvl)); this%has_newcell=.false.
       allocate(this%FUx(0:amr%maxlvl),this%FVy(0:amr%maxlvl),this%FWz(0:amr%maxlvl))
       allocate(this%FUy(0:amr%maxlvl),this%FVx(0:amr%maxlvl))
       allocate(this%FUz(0:amr%maxlvl),this%FWx(0:amr%maxlvl))
@@ -502,12 +515,15 @@ contains
    !> Override on_coarse: create new fine level from coarse
    !> Momentum is rebuilt from the interpolated face velocity in post_regrid
    subroutine on_coarse(this,lvl,time,ba,dm)
+      use amrex_amr_module, only: amrex_multifab_build
       implicit none
       class(amrmpcomp), intent(inout) :: this
       integer, intent(in) :: lvl
       real(WP), intent(in) :: time
       type(amrex_boxarray), intent(in) :: ba
       type(amrex_distromap), intent(in) :: dm
+      ! Every cell of the new level is new: post_regrid gives it the coarse phasic pressures
+      call amrex_multifab_build(this%newcell(lvl),ba,dm,1,0); call this%newcell(lvl)%setval(1.0_WP); this%has_newcell(lvl)=.true.
       ! Parent handles face velocities, divergence, Q, and VOF data
       call this%amrmpflow%on_coarse(lvl,time,ba,dm)
       ! Momentum and derived variables are reset
@@ -518,12 +534,18 @@ contains
 
    !> Override on_remake: migrate data on regrid
    subroutine on_remake(this,lvl,time,ba,dm)
+      use amrex_amr_module, only: amrex_multifab_build,amrex_multifab_destroy
       implicit none
       class(amrmpcomp), intent(inout) :: this
       integer, intent(in) :: lvl
       real(WP), intent(in) :: time
       type(amrex_boxarray), intent(in) :: ba
       type(amrex_distromap), intent(in) :: dm
+      type(amrex_multifab) :: kept
+      ! Cells of the new layout that the old layout does not hold are new: post_regrid gives them the coarse phasic pressures
+      call amrex_multifab_build(this%newcell(lvl),ba,dm,1,0); call this%newcell(lvl)%setval(1.0_WP); this%has_newcell(lvl)=.true.
+      call amrex_multifab_build(kept,this%Q%mf(lvl)%ba,this%Q%mf(lvl)%dm,1,0); call kept%setval(0.0_WP)
+      call this%newcell(lvl)%parallel_copy(kept,this%amr%geom(lvl)); call amrex_multifab_destroy(kept)
       ! Parent handles face velocities, divergence, Q, and VOF data
       call this%amrmpflow%on_remake(lvl,time,ba,dm)
       ! Momentum and derived variables are reset
@@ -657,17 +679,51 @@ contains
       call amrex_multifab_destroy(this%Pj)
    end subroutine destroy_fluxes
 
-   !> Override post_regrid: average down and fill, rebuild momentum from the regridded face velocity, then rebuild primitive variables
+   !> Override post_regrid: average down and fill, rebuild momentum from the regridded face velocity, give new fine cells the
+   !> energy of the coarse phasic pressures (torrens), restrict, then rebuild primitive variables
    subroutine post_regrid(this,lbase,time)
+      use amrex_amr_module, only: amrex_multifab_destroy
       implicit none
       class(amrmpcomp), intent(inout) :: this
       integer, intent(in) :: lbase
       real(WP), intent(in) :: time
+      integer :: lvl,i,j,k
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pU,pV,pW,pVF,pRHOL,pRHOG,pPL,pPG,pNew
+      real(WP), dimension(2) :: mk
+      real(WP) :: Kc
       ! Parent handles face velocities, Q, and VOF data
       call this%amrmpflow%post_regrid(lbase,time)
       ! Momentum from face velocity and face density
       call this%get_momentum()
-      ! Rebuild primitive variables
+      ! New fine cells: phasic internal contents from the coarse parent's phasic pressures, plus the mass share of the fine kinetic energy
+      do lvl=1,this%amr%clvl()
+         if (.not.this%has_newcell(lvl)) cycle
+         call this%get_primitive(this%Q,this%rhoU,this%rhoV,this%rhoW,time)
+         call this%PL%fill_from_coarse(lvl,time); call this%PG%fill_from_coarse(lvl,time)
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pQ=>this%Q%mf(lvl)%dataptr(mfi); pVF=>this%VF%mf(lvl)%dataptr(mfi); pNew=>this%newcell(lvl)%dataptr(mfi)
+            pU=>this%U%mf(lvl)%dataptr(mfi); pV=>this%V%mf(lvl)%dataptr(mfi); pW=>this%W%mf(lvl)%dataptr(mfi)
+            pRHOL=>this%RHOL%mf(lvl)%dataptr(mfi); pRHOG=>this%RHOG%mf(lvl)%dataptr(mfi)
+            pPL=>this%PL%mf(lvl)%dataptr(mfi); pPG=>this%PG%mf(lvl)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (pNew(i,j,k,1).lt.0.5_WP) cycle
+               mk=max(pQ(i,j,k,1:2),0.0_WP)
+               Kc=cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+               if (pRHOL(i,j,k,1).gt.0.0_WP.and.pPL(i,j,k,1).ne.0.0_WP) pQ(i,j,k,3)=pVF(i,j,k,1)*this%liq%get_rhoe_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP]) &
+               &                                                                    +mk(1)/max(sum(mk),this%rho_floor)*Kc
+               if (pRHOG(i,j,k,1).gt.0.0_WP.and.pPG(i,j,k,1).ne.0.0_WP) pQ(i,j,k,4)=(1.0_WP-pVF(i,j,k,1))*this%gas%get_rhoe_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP]) &
+               &                                                                    +mk(2)/max(sum(mk),this%rho_floor)*Kc
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+         call amrex_multifab_destroy(this%newcell(lvl)); this%has_newcell(lvl)=.false.
+      end do
+      ! Restrict and fill, then rebuild primitive variables
+      call this%restrict_Q(time)
       call this%get_primitive(this%Q,this%rhoU,this%rhoV,this%rhoW,time)
    end subroutine post_regrid
 
@@ -1081,9 +1137,65 @@ end subroutine get_cell_velocity
          end do
          call this%amr%mfiter_destroy(mfi)
       end do
-      call this%Q%average_down(); call this%Q%fill(time=time)
+      call this%restrict_Q(time)
       call this%get_primitive(this%Q,this%rhoU,this%rhoV,this%rhoW,time)
    end subroutine get_total_energy
+
+   !> Restrict Q from finest to coarsest: masses are averaged, and a covered cell's phasic total energies are its
+   !> restricted internal contents plus the mass shares of its own kinetic energy
+   subroutine restrict_Q(this,time)
+      use amrex_amr_module, only: amrex_imultifab,amrex_imultifab_build,amrex_imultifab_destroy,amrex_multifab_build,amrex_multifab_destroy
+      use amrex_interface,  only: amrmask_make_fine,amrmfab_average_down_cell
+      implicit none
+      class(amrmpcomp), intent(inout) :: this
+      real(WP), intent(in) :: time
+      integer :: lvl,i,j,k
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      type(amrex_multifab) :: Yf,Yc
+      type(amrex_imultifab) :: mask
+      integer, dimension(:,:,:,:), contiguous, pointer :: pMask
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pU,pV,pW,pY
+      real(WP), dimension(2) :: mk
+      ! Face velocities of the current momenta, averaged onto covered coarse faces
+      call this%get_face_velocity(this%Q,this%rhoU,this%rhoV,this%rhoW,time)
+      do lvl=this%amr%clvl()-1,0,-1
+         ! Internal contents of the fine level's valid cells
+         call amrex_multifab_build(Yf,this%amr%ba(lvl+1),this%amr%dm(lvl+1),2,0)
+         call this%amr%mfiter_build(lvl+1,mfi)
+         do while (mfi%next())
+            pQ=>this%Q%mf(lvl+1)%dataptr(mfi); pY=>Yf%dataptr(mfi)
+            pU=>this%U%mf(lvl+1)%dataptr(mfi); pV=>this%V%mf(lvl+1)%dataptr(mfi); pW=>this%W%mf(lvl+1)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               mk=max(pQ(i,j,k,1:2),0.0_WP)
+               pY(i,j,k,1:2)=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+         ! Restrict masses (total energies of covered cells are replaced below) and internal contents
+         call this%Q%average_downto(lvl); call this%Q%sync_lvl(lvl)
+         call amrex_multifab_build(Yc,this%amr%ba(lvl),this%amr%dm(lvl),2,0)
+         call amrmfab_average_down_cell(fmf=Yf,cmf=Yc,rr=[this%amr%rrefx(lvl),this%amr%rrefy(lvl),this%amr%rrefz(lvl)],cgeom=this%amr%geom(lvl),ngcrse=0)
+         ! Covered cells: restricted internal contents plus the mass shares of the coarse kinetic energy
+         call amrex_imultifab_build(mask,this%amr%ba(lvl),this%amr%dm(lvl),1,0)
+         call amrmask_make_fine(mask,this%amr%ba(lvl+1),[this%amr%rrefx(lvl),this%amr%rrefy(lvl),this%amr%rrefz(lvl)],0,1)
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pQ=>this%Q%mf(lvl)%dataptr(mfi); pY=>Yc%dataptr(mfi); pMask=>mask%dataptr(mfi)
+            pU=>this%U%mf(lvl)%dataptr(mfi); pV=>this%V%mf(lvl)%dataptr(mfi); pW=>this%W%mf(lvl)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (pMask(i,j,k,1).ne.0) cycle
+               mk=max(pQ(i,j,k,1:2),0.0_WP)
+               pQ(i,j,k,3:4)=pY(i,j,k,1:2)+mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+         call amrex_multifab_destroy(Yf); call amrex_multifab_destroy(Yc); call amrex_imultifab_destroy(mask)
+      end do
+      call this%Q%fill(time=time)
+   end subroutine restrict_Q
 
    !> Mixture kinetic energy of cell (i,j,k)
    pure real(WP) function cell_ke(pQ,pU,pV,pW,i,j,k,rho_floor) result(ke)
@@ -1095,6 +1207,19 @@ end subroutine get_cell_velocity
       &          +max(0.5_WP*sum(pQ(i,j-1:j,k,1:2)),rho_floor)*pV(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j:j+1,k,1:2)),rho_floor)*pV(i,j+1,k,1)**2 &
       &          +max(0.5_WP*sum(pQ(i,j,k-1:k,1:2)),rho_floor)*pW(i,j,k,1)**2+max(0.5_WP*sum(pQ(i,j,k:k+1,1:2)),rho_floor)*pW(i,j,k+1,1)**2)
    end function cell_ke
+
+   !> Isentrope factor (p+pinf)**(1/gamma) of a gas state, with gamma=1+Gruneisen and p+pinf=rho*c**2/gamma from the gas
+   !> law (exact for ideal and stiffened gases)
+   real(WP) function isentrope_factor(gas,p,rho) result(theta)
+      implicit none
+      class(material), intent(in) :: gas
+      real(WP), intent(in) :: p,rho
+      real(WP) :: g
+      theta=0.0_WP
+      if (rho.le.0.0_WP) return
+      g=1.0_WP+gas%get_gruneisen_from_rho_e(rho=rho,e=gas%get_e_from_p_rho(p=p,rho=rho,y=[1.0_WP]),y=[1.0_WP])
+      theta=(rho*gas%get_c_from_p_rho(p=p,rho=rho,y=[1.0_WP])**2/g)**(1.0_WP/g)
+   end function isentrope_factor
 
    ! ============================================================================
    ! PHYSICS METHODS
@@ -1115,8 +1240,10 @@ end subroutine get_cell_velocity
       type(amrex_box) :: bx
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pRHOL,pRHOG,pIL,pIG,pPL,pPG,pTL,pTG,pP,pC
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW
-      real(WP), dimension(2) :: Y,mk
+      real(WP), dimension(2) :: CLG
       real(WP) :: CL,CG
+      type(amrex_box) :: vbx
+      logical :: ghost,outside
       ! Check passed Q is as expected
       if (Q%ncomp.ne.this%nQ) call die('[amrmpcomp get_primitive] Q has wrong number of components')
       if (Q%ng.lt.this%nover) call die('[amrmpcomp get_primitive] Q must have at least nover ghost cells')
@@ -1153,15 +1280,46 @@ end subroutine get_cell_velocity
                   pRHOG(i,j,k,1)=0.0_WP
                end if
             end do; end do; end do
-            ! Phasic internal energies from total energies, then phasic and mixture pressures
+            ! Phasic internal energies from total energies, then phasic pressures
             bx=mfi%growntilebox(min(this%PL%ng,this%PG%ng,this%P%ng))
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               mk=max(pQ(i,j,k,1:2),0.0_WP)
-               Y=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
-               pPL(i,j,k,1)=0.0_WP
-               if (pRHOL(i,j,k,1).gt.0.0_WP.and.Y(1).gt.0.0_WP) pPL(i,j,k,1)=this%liq%get_p_from_rho_e(rho=pRHOL(i,j,k,1),e=Y(1)/pQ(i,j,k,1),y=[1.0_WP])
-               pPG(i,j,k,1)=0.0_WP
-               if (pRHOG(i,j,k,1).gt.0.0_WP.and.Y(2).gt.0.0_WP) pPG(i,j,k,1)=this%gas%get_p_from_rho_e(rho=pRHOG(i,j,k,1),e=Y(2)/pQ(i,j,k,2),y=[1.0_WP])
+               call phasic_pressures(i,j,k)
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+         ! Coarse/fine ghosts take the coarse parent's phasic pressures (torrens): piecewise-constant fill
+         if (lvl.gt.0) then
+            call this%PL%fill_lvl(lvl,time); call this%PG%fill_lvl(lvl,time)
+         end if
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            ! Get pointers to data
+            pQ  =>Q%mf(lvl)%dataptr(mfi)
+            pU  =>this%U%mf(lvl)%dataptr(mfi); pV=>this%V%mf(lvl)%dataptr(mfi); pW=>this%W%mf(lvl)%dataptr(mfi)
+            pVF =>this%VF%mf(lvl)%dataptr(mfi)
+            pRHOL=>this%RHOL%mf(lvl)%dataptr(mfi); pRHOG=>this%RHOG%mf(lvl)%dataptr(mfi)
+            pIL =>this%IL%mf(lvl)%dataptr(mfi);   pIG =>this%IG%mf(lvl)%dataptr(mfi)
+            pPL =>this%PL%mf(lvl)%dataptr(mfi);   pPG =>this%PG%mf(lvl)%dataptr(mfi)
+            pTL =>this%TL%mf(lvl)%dataptr(mfi);   pTG =>this%TG%mf(lvl)%dataptr(mfi)
+            pP  =>this%P%mf(lvl)%dataptr(mfi)
+            pC  =>this%C%mf(lvl)%dataptr(mfi)
+            ! Ghosts outside a non-periodic domain boundary, or whose coarse parent lacks the phase, keep their own pressures;
+            ! then the mixture pressure
+            vbx=mfi%validbox()
+            bx=mfi%growntilebox(min(this%PL%ng,this%PG%ng,this%P%ng))
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (lvl.gt.0) then
+                  ghost=any([i,j,k].lt.vbx%lo).or.any([i,j,k].gt.vbx%hi)
+                  if (ghost) then
+                     outside=(.not.this%amr%xper.and.(i.lt.this%amr%geom(lvl)%domain%lo(1).or.i.gt.this%amr%geom(lvl)%domain%hi(1))).or. &
+                     &       (.not.this%amr%yper.and.(j.lt.this%amr%geom(lvl)%domain%lo(2).or.j.gt.this%amr%geom(lvl)%domain%hi(2))).or. &
+                     &       (.not.this%amr%zper.and.(k.lt.this%amr%geom(lvl)%domain%lo(3).or.k.gt.this%amr%geom(lvl)%domain%hi(3)))
+                     CLG=[pPL(i,j,k,1),pPG(i,j,k,1)]
+                     call phasic_pressures(i,j,k)
+                     if (.not.outside.and.CLG(1).ne.0.0_WP.and.pRHOL(i,j,k,1).gt.0.0_WP) pPL(i,j,k,1)=CLG(1)
+                     if (.not.outside.and.CLG(2).ne.0.0_WP.and.pRHOG(i,j,k,1).gt.0.0_WP) pPG(i,j,k,1)=CLG(2)
+                  end if
+               end if
                pP(i,j,k,1)=pVF(i,j,k,1)*pPL(i,j,k,1)+(1.0_WP-pVF(i,j,k,1))*pPG(i,j,k,1)
             end do; end do; end do
             ! Phasic temperatures
@@ -1194,6 +1352,20 @@ end subroutine get_cell_velocity
          call this%amr%mfiter_destroy(mfi)
       end do
       this%wt_prim=this%wt_prim+(MPI_Wtime()-tw0)
+   contains
+      !> Phasic pressures of cell (i,j,k) from its phasic total energies less the mass shares of its kinetic energy; zero for an
+      !> absent phase or a non-positive internal content
+      subroutine phasic_pressures(i,j,k)
+         implicit none
+         integer, intent(in) :: i,j,k
+         real(WP), dimension(2) :: Y,mk
+         mk=max(pQ(i,j,k,1:2),0.0_WP)
+         Y=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+         pPL(i,j,k,1)=0.0_WP
+         if (pRHOL(i,j,k,1).gt.0.0_WP.and.Y(1).gt.0.0_WP) pPL(i,j,k,1)=this%liq%get_p_from_rho_e(rho=pRHOL(i,j,k,1),e=Y(1)/pQ(i,j,k,1),y=[1.0_WP])
+         pPG(i,j,k,1)=0.0_WP
+         if (pRHOG(i,j,k,1).gt.0.0_WP.and.Y(2).gt.0.0_WP) pPG(i,j,k,1)=this%gas%get_p_from_rho_e(rho=pRHOG(i,j,k,1),e=Y(2)/pQ(i,j,k,2),y=[1.0_WP])
+      end subroutine phasic_pressures
    end subroutine get_primitive
 
    !> Calculate dQdt(1:4) and drhoUVWdt. Geometric VOF/CTU is used in band region, dissipation-free scheme in bulk.
@@ -1925,8 +2097,9 @@ end subroutine get_cell_velocity
             xg(a)=xg(a)-0.5_WP*h(a)
             xg(b)=xg(b)-0.5_WP*h(b)
          end if
-         ! Side, CFL number, and line from the current velocity
+         ! Side, CFL number, and line from the velocity at the midpoint of an RK2 backtrace from the site
          ug=interp_velocity(xg)
+         ug=interp_velocity(xg-0.5_WP*dt*ug)
          nu=dt*abs(ug(b))/h(b)
          if (ug(b).ge.0.0_WP) then
             fdown=cv2; fup=cv1; fupup=cv1-eu(:,b)
@@ -2143,6 +2316,7 @@ end subroutine get_cell_velocity
             myVflux(6:8)=vol_tot*bary_tot
             myQflux(1:2)=vol_tot*pQold(i0,j0,k0,1:2)
             myQflux(3:4)=vol_tot*[rhoe_old(1,i0,j0,k0),rhoe_old(2,i0,j0,k0)]
+            myQflux(isl)=vol_tot*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1))
             call donor_moments(i0,j0,k0,myQflux)
             return
          end if
@@ -2214,6 +2388,7 @@ end subroutine get_cell_velocity
          if (VF0.le.VFhi) then
             myQflux(2)=myVflux(2)*pQold(i0,j0,k0,2)/(1.0_WP-VF0)
             myQflux(4)=myVflux(2)*rhoe_old(2,i0,j0,k0)
+            myQflux(isl)=myVflux(2)*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1))
          end if
          call donor_moments(i0,j0,k0,myQflux)
 
@@ -2309,26 +2484,86 @@ end subroutine get_cell_velocity
 
    end subroutine get_dQdt
 
+   !> Add particle energy before the phasic work update and restriction in get_energy.
+   !> U, V, W must hold that energy pass's midpoint velocities. This does not update momentum.
+   subroutine add_particle_energy(this,dt,energy_source,force_source)
+      use messager, only: die
+      implicit none
+      class(amrmpcomp), intent(inout) :: this
+      real(WP), intent(in) :: dt
+      type(amrdata), intent(in), optional :: energy_source,force_source(3)
+      integer :: lvl,i,j,k,n1
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      real(WP) :: source_work,source_energy,alpha(2),mk(2)
+      logical :: coupled
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pU,pV,pW
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pES,pSXforce,pSYforce,pSZforce
+      coupled=present(energy_source).and.present(force_source)
+      if (present(energy_source).neqv.present(force_source)) &
+         call die('[add_particle_energy] energy_source and force_source must be supplied together')
+      if (coupled) then
+         if (energy_source%ncomp.ne.1.or.any(energy_source%nodal)) call die('[add_particle_energy] energy_source must be cell centered')
+         do n1=1,3
+            if (force_source(n1)%ncomp.ne.1.or.any(force_source(n1)%nodal.neqv.(eu(:,n1).eq.1))) &
+               call die('[add_particle_energy] force_source must contain the three staggered force rates')
+         end do
+      end if
+      if (.not.coupled) return
+      do lvl=0,this%amr%clvl()
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pQ=>this%Q%mf(lvl)%dataptr(mfi); pVF=>this%VF%mf(lvl)%dataptr(mfi)
+            pU=>this%U%mf(lvl)%dataptr(mfi)
+            pV=>this%V%mf(lvl)%dataptr(mfi)
+            pW=>this%W%mf(lvl)%dataptr(mfi)
+            pES=>energy_source%mf(lvl)%dataptr(mfi)
+            pSXforce=>force_source(1)%mf(lvl)%dataptr(mfi)
+            pSYforce=>force_source(2)%mf(lvl)%dataptr(mfi)
+            pSZforce=>force_source(3)%mf(lvl)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               mk=max(pQ(i,j,k,1:2),0.0_WP); mk=mk/max(sum(mk),this%rho_floor)
+               ! cell_ke owns half of each surrounding face's kinetic energy. Its force work
+               ! is therefore half the sum of force times this energy pass's midpoint velocity.
+               source_work=0.5_WP*(pSXforce(i,j,k,1)*pU(i,j,k,1)+pSXforce(i+1,j,k,1)*pU(i+1,j,k,1) &
+                  +pSYforce(i,j,k,1)*pV(i,j,k,1)+pSYforce(i,j+1,k,1)*pV(i,j+1,k,1) &
+                  +pSZforce(i,j,k,1)*pW(i,j,k,1)+pSZforce(i,j,k+1,1)*pW(i,j,k+1,1))
+               source_energy=pES(i,j,k,1)
+               alpha=[pVF(i,j,k,1),1.0_WP-pVF(i,j,k,1)]
+               ! Mechanical KE belongs to phases by mass; the internal-energy remainder by volume.
+               ! Summing phases gives exactly dt*source_energy. Neither phasic update branch already
+               ! contains this external-force work; add it once before either branch.
+               pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+dt*(mk*source_work+alpha*(source_energy-source_work))
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+      end do
+   end subroutine add_particle_energy
+
    !> Build up the rest of phasic total energy using the updated face velocity, mass and momentum fluxes, and pressure and viscous work
    !> Bulk phase simplifies to adding centered KE contribution alongside the pressure and viscous work directly
    !> Mixture region requires redistributing the KE contribution by mass while viscous and pressure work is weighted by VF
-   subroutine get_energy(this,dt,time)
+   subroutine get_energy(this,dt,time,energy_source,force_source)
       use mpi_f08,         only: MPI_Wtime
       use amrex_interface, only: amrmfab_average_down_face
       implicit none
       class(amrmpcomp), intent(inout) :: this
       real(WP), intent(in) :: dt
       real(WP), intent(in) :: time
+      ! Optional particle rates: cell total energy and the exact three staggered force densities
+      ! used in the momentum RHS. Both are frozen across the flow sub-iterations.
+      type(amrdata), intent(in), optional :: energy_source,force_source(3)
       real(WP) :: tw0
-      integer :: lvl,i,j,k,n1,n2,rerr
+      integer :: lvl,i,j,k,n1,n2
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP) :: dxi,dyi,dzi,div,dss,dW,Kn,Cap
+      real(WP) :: dxi,dyi,dzi,div,dss,dW,Kn,Cap,Asl,aG,Pst,dY,rG,eG,cG,g
       real(WP), dimension(3) :: gradU
       real(WP), dimension(2) :: S,mk,mkn,Yb
-      real(WP), dimension(4) :: q
       logical :: inband
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pQold,pVF,pPL,pPG,pP,pU,pV,pW,pUold,pVold,pWold,pBand
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVFold,pPGold,pRHOGold,pSx,pSy,pSz
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pFx,pFy,pFz,pEx,pEy,pEz,pUm,pVm,pWm,pVisc,pBeta
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pFUx,pFUy,pFUz,pFVx,pFVy,pFVz,pFWx,pFWy,pFWz
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pPjx,pPjy,pPjz
@@ -2340,33 +2575,42 @@ end subroutine get_cell_velocity
       call this%U%lincomb(a=0.5_WP,src1=this%Uold,b=0.5_WP,src2=this%U)
       call this%V%lincomb(a=0.5_WP,src1=this%Vold,b=0.5_WP,src2=this%V)
       call this%W%lincomb(a=0.5_WP,src1=this%Wold,b=0.5_WP,src2=this%W)
-      ! Sliver equilibration (torrens): a mixed cell of the finest level whose transported gas fraction is below sliver_frac,
-      ! with both phases present, is relaxed by the relaxation model (with relax_isentropic, the gas keeps its entropy). The
-      ! model acts on the transported internal contents Y^tr_k, and their change is added to Q(3:4). This
-      ! changes VF and the transported internal contents, and so the phasic work below
+      ! Sliver equilibration (torrens): in a mixed cell of the finest level whose transported gas fraction is below sliver_frac,
+      ! with both phases present, the gas parcels it holds (each on its start-of-step isentrope) reach one pressure p* in the
+      ! fixed gas volume aG=1-VF, (p*+pinf)**(1/gamma)=A/aG, with A the transported sum of gas volume times (pG+pinf)**(1/gamma).
+      ! The gas internal content becomes that at p*, the liquid takes the difference, and VF is unchanged
       this%cnt%nsliver=0.0_WP
-      if (associated(this%relax)) then
-         lvl=this%amr%maxlvl
-         call this%amr%mfiter_build(lvl,mfi)
-         do while (mfi%next())
-            pQ=>this%Q%mf(lvl)%dataptr(mfi); pVF=>this%VF%mf(lvl)%dataptr(mfi); pQold=>this%Qold%mf(lvl)%dataptr(mfi)
-            pUold=>this%Uold%mf(lvl)%dataptr(mfi); pVold=>this%Vold%mf(lvl)%dataptr(mfi); pWold=>this%Wold%mf(lvl)%dataptr(mfi)
-            bx=mfi%tilebox()
-            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               if (pVF(i,j,k,1).lt.VFlo.or.pVF(i,j,k,1).gt.VFhi.or.1.0_WP-pVF(i,j,k,1).ge.this%sliver_frac) cycle
-               if (any(pQ(i,j,k,1:2).le.0.0_WP)) cycle
-               mkn=max(pQold(i,j,k,1:2),0.0_WP)
-               q(1:2)=pQ(i,j,k,1:2)
-               q(3:4)=pQ(i,j,k,3:4)-mkn/max(sum(mkn),this%rho_floor)*cell_ke(pQold,pUold,pVold,pWold,i,j,k,this%rho_floor)
-               Yb=q(3:4)
-               call this%relax%apply(dt=dt,VF=pVF(i,j,k,1),Q=q,Pjump=0.0_WP,ierr=rerr)
-               pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+q(3:4)-Yb
-               if (rerr.eq.RELAX_OK) this%cnt%nsliver=this%cnt%nsliver+1.0_WP
-            end do; end do; end do
-         end do
-         call this%amr%mfiter_destroy(mfi)
-         call this%VF%average_down(); call this%fill(lvl=this%amr%maxlvl,time=time)
-      end if
+      lvl=this%amr%maxlvl
+      dxi=1.0_WP/this%amr%dx(lvl); dyi=1.0_WP/this%amr%dy(lvl); dzi=1.0_WP/this%amr%dz(lvl)
+      call this%amr%mfiter_build(lvl,mfi)
+      do while (mfi%next())
+         pQ=>this%Q%mf(lvl)%dataptr(mfi); pVF=>this%VF%mf(lvl)%dataptr(mfi); pQold=>this%Qold%mf(lvl)%dataptr(mfi)
+         pUold=>this%Uold%mf(lvl)%dataptr(mfi); pVold=>this%Vold%mf(lvl)%dataptr(mfi); pWold=>this%Wold%mf(lvl)%dataptr(mfi)
+         pVFold=>this%VFold%mf(lvl)%dataptr(mfi); pPGold=>this%PGold%mf(lvl)%dataptr(mfi); pRHOGold=>this%RHOGold%mf(lvl)%dataptr(mfi)
+         pSx=>this%SLF(1)%dataptr(mfi); pSy=>this%SLF(2)%dataptr(mfi); pSz=>this%SLF(3)%dataptr(mfi)
+         bx=mfi%tilebox()
+         do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+            if (pVF(i,j,k,1).lt.VFlo.or.pVF(i,j,k,1).gt.VFhi.or.1.0_WP-pVF(i,j,k,1).ge.this%sliver_frac) cycle
+            if (any(pQ(i,j,k,1:2).le.0.0_WP)) cycle
+            ! Transported internal contents
+            mkn=max(pQold(i,j,k,1:2),0.0_WP)
+            Yb=pQ(i,j,k,3:4)-mkn/max(sum(mkn),this%rho_floor)*cell_ke(pQold,pUold,pVold,pWold,i,j,k,this%rho_floor)
+            ! Isentrope sum of the gas parcels: the cell's own start-of-step gas, then the band face fluxes
+            Asl=(1.0_WP-pVFold(i,j,k,1))*isentrope_factor(this%gas,pPGold(i,j,k,1),pRHOGold(i,j,k,1))
+            Asl=Asl+dt*(dxi*(pSx(i+1,j,k,isl)-pSx(i,j,k,isl))+dyi*(pSy(i,j+1,k,isl)-pSy(i,j,k,isl))+dzi*(pSz(i,j,k+1,isl)-pSz(i,j,k,isl)))
+            if (Asl.le.0.0_WP.or.Yb(2).le.0.0_WP) cycle
+            ! Gas content at the common pressure (gas law constants from the transported gas state), and the change handed to the liquid
+            aG=1.0_WP-pVF(i,j,k,1); rG=pQ(i,j,k,2)/aG; eG=Yb(2)/pQ(i,j,k,2)
+            cG=this%gas%get_c_from_rho_e(rho=rG,e=eG,y=[1.0_WP]); if (cG.le.0.0_WP) cycle
+            g=1.0_WP+this%gas%get_gruneisen_from_rho_e(rho=rG,e=eG,y=[1.0_WP])
+            Pst=(Asl/aG)**g-(rG*cG**2/g-this%gas%get_p_from_rho_e(rho=rG,e=eG,y=[1.0_WP]))
+            dY=aG*this%gas%get_rhoe_from_p_rho(p=Pst,rho=rG,y=[1.0_WP])-Yb(2)
+            pQ(i,j,k,4)=pQ(i,j,k,4)+dY
+            pQ(i,j,k,3)=pQ(i,j,k,3)-dY
+            this%cnt%nsliver=this%cnt%nsliver+1.0_WP
+         end do; end do; end do
+      end do
+      call this%amr%mfiter_destroy(mfi)
       ! Mixture work flux on the valid faces: per direction, the momentum through the face at the two cells (its own axis)
       ! and at the two edges of each other axis, then the pressure work and the normal viscous work
       do lvl=0,this%amr%clvl()
@@ -2427,6 +2671,7 @@ end subroutine get_cell_velocity
          call amrmfab_average_down_face(fmf=this%Ey(lvl),cmf=this%Ey(lvl-1),rr=[this%amr%rrefx(lvl-1),this%amr%rrefy(lvl-1),this%amr%rrefz(lvl-1)],cgeom=this%amr%geom(lvl-1))
          call amrmfab_average_down_face(fmf=this%Ez(lvl),cmf=this%Ez(lvl-1),rr=[this%amr%rrefx(lvl-1),this%amr%rrefy(lvl-1),this%amr%rrefz(lvl-1)],cgeom=this%amr%geom(lvl-1))
       end do
+      call add_particle_energy(this,dt,energy_source,force_source)
       ! Phasic total energies on the valid cells: flux form off the band, direct treatment in band cells
       do lvl=0,this%amr%clvl()
          dxi=1.0_WP/this%amr%dx(lvl)
@@ -2482,7 +2727,7 @@ end subroutine get_cell_velocity
          call this%amr%mfiter_destroy(mfi)
       end do
       ! Restrict and fill
-      call this%Q%average_down(); call this%Q%fill(time=time)
+      call this%restrict_Q(time)
       this%wt_div=this%wt_div+(MPI_Wtime()-tw0); this%wt_dQdt=this%wt_dQdt+(MPI_Wtime()-tw0)
    contains
       !> Kinetic energy flux through a dual face: the centered mass flux g times half the product of
@@ -2543,11 +2788,13 @@ end subroutine get_cell_velocity
       end function dev
    end subroutine get_energy
 
-   !> Apply the relaxation model in mixed cells of the finest level, then re-match the PLIC
-   !> plane to the relaxed VF. Q(1:2) and Q(3)+Q(4) are conserved 
+   !> Positivity gate on every uncovered cell, then the relaxation model in mixed cells of the finest level, then re-match the
+   !> PLIC plane to the relaxed VF. The relaxation conserves Q(1:2) and Q(3)+Q(4)
    subroutine apply_relax(this,dt,time)
-      use amrvof_geometry, only: get_plane_dist,cut_hex_vol
-      use mpi_f08,         only: MPI_Wtime
+      use amrvof_geometry,  only: get_plane_dist,cut_hex_vol
+      use amrex_amr_module, only: amrex_imultifab,amrex_imultifab_build,amrex_imultifab_destroy
+      use amrex_interface,  only: amrmask_make_fine
+      use mpi_f08,          only: MPI_Wtime
       implicit none
       class(amrmpcomp), intent(inout) :: this
       real(WP), intent(in) :: dt
@@ -2556,24 +2803,55 @@ end subroutine get_cell_velocity
       integer :: lvl,i,j,k,rerr
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
+      type(amrex_imultifab) :: mask
+      integer, dimension(:,:,:,:), contiguous, pointer :: pMask
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pQ,pCL,pCG,pPLIC,pU,pV,pW,pRHOU,pRHOV,pRHOW,pCurv
-      logical :: oldmix,newmix,gated
-      real(WP) :: dx,dy,dz,cell_vol,vol_liq,vol_gas
+      logical :: oldmix,newmix,refused
+      real(WP) :: dx,dy,dz,cell_vol,vol_liq,vol_gas,VFb
       real(WP), dimension(3) :: lo,hi,bary_liq,bary_gas
       real(WP), dimension(3,8) :: hex
       real(WP), dimension(4) :: plane,q
       real(WP), dimension(2) :: mk,Yb
       ! Reset failure and gate counters
       this%cnt%nrelax_fail=0.0_WP
-      this%cnt%ngate=0.0_WP; this%cnt%gate_mass=0.0_WP; this%cnt%gate_energy=0.0_WP
+      this%cnt%ngate=0.0_WP; this%cnt%ngate_floor=0.0_WP; this%cnt%gate_mass=0.0_WP; this%cnt%gate_energy=0.0_WP
       this%cnt%gate_rhoU=0.0_WP; this%cnt%gate_rhoV=0.0_WP; this%cnt%gate_rhoW=0.0_WP
-      ! If no relaxation model was provided, return
-      if (.not.associated(this%relax)) return
-      ! Return if clvl<maxlvl
-      if (this%amr%clvl().lt.this%amr%maxlvl) return
       ! Face velocities of the new iterate, for its kinetic energy
       call this%get_face_velocity(this%Q,this%rhoU,this%rhoV,this%rhoW,time)
       tw0=MPI_Wtime()
+      ! Positivity gate (torrens) on the valid cells of every level not covered by a finer level, before any relaxation
+      do lvl=0,this%amr%clvl()
+         if (lvl.lt.this%amr%clvl()) then
+            call amrex_imultifab_build(mask,this%amr%ba(lvl),this%amr%dm(lvl),1,0)
+            call amrmask_make_fine(mask,this%amr%ba(lvl+1),[this%amr%rrefx(lvl),this%amr%rrefy(lvl),this%amr%rrefz(lvl)],0,1)
+         end if
+         cell_vol=this%amr%cell_vol(lvl)
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pVF=>this%VF%mf(lvl)%dataptr(mfi); pQ=>this%Q%mf(lvl)%dataptr(mfi)
+            pU=>this%U%mf(lvl)%dataptr(mfi); pRHOU=>this%rhoU%mf(lvl)%dataptr(mfi)
+            pV=>this%V%mf(lvl)%dataptr(mfi); pRHOV=>this%rhoV%mf(lvl)%dataptr(mfi)
+            pW=>this%W%mf(lvl)%dataptr(mfi); pRHOW=>this%rhoW%mf(lvl)%dataptr(mfi)
+            if (lvl.lt.this%amr%clvl()) pMask=>mask%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (lvl.lt.this%amr%clvl()) then; if (pMask(i,j,k,1).eq.0) cycle; end if
+               ! Masses and internal contents, Y_k=E_k-m_k/rho*K
+               mk=max(pQ(i,j,k,1:2),0.0_WP)
+               q(1:2)=pQ(i,j,k,1:2)
+               q(3:4)=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+               call gate_cell(lvl,i,j,k,q)
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+         if (lvl.lt.this%amr%clvl()) call amrex_imultifab_destroy(mask)
+      end do
+      ! Without a relaxation model or the finest level, restrict and return
+      if (.not.associated(this%relax).or.this%amr%clvl().lt.this%amr%maxlvl) then
+         call this%restrict_Q(time)
+         this%wt_relax=this%wt_relax+(MPI_Wtime()-tw0)
+         return
+      end if
       ! Apply relaxation on finest level only (mixture cells are always at finest)
       lvl=this%amr%maxlvl
       dx=this%amr%dx(lvl); dy=this%amr%dy(lvl); dz=this%amr%dz(lvl)
@@ -2595,22 +2873,21 @@ end subroutine get_cell_velocity
          do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
             ! Check if mixture cell prior to relaxation
             oldmix=(pVF(i,j,k,1).ge.VFlo.and.pVF(i,j,k,1).le.VFhi)
-            gated=.false.; rerr=RELAX_OK
+            rerr=RELAX_OK
             if (oldmix) then
                ! Internal contents of the mixed cell, Y_k=E_k-m_k/rho*K
                mk=max(pQ(i,j,k,1:2),0.0_WP)
                q(1:2)=pQ(i,j,k,1:2)
                q(3:4)=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
-               ! Positivity gate before the relaxation
-               call gate_cell(i,j,k,q,gated)
                ! User-provided relaxation model to the capillary pressure jump (modifies VF and q), and the internal energy
                ! it exchanges added to E_k
-               if (.not.gated) then
-                  Yb=q(3:4)
-                  call this%relax%apply(dt=dt,VF=pVF(i,j,k,1),Q=q,Pjump=this%sigma*pCurv(i,j,k,1),ierr=rerr)
-                  pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+q(3:4)-Yb
-               end if
-               if (rerr.ne.RELAX_OK) this%cnt%nrelax_fail=this%cnt%nrelax_fail+1.0_WP
+               Yb=q(3:4); VFb=pVF(i,j,k,1)
+               call this%relax%apply(dt=dt,VF=pVF(i,j,k,1),Q=q,Pjump=this%sigma*pCurv(i,j,k,1),ierr=rerr)
+               ! Refuse a relaxation that leaves the gas below rhoG_min (torrens)
+               refused=rerr.eq.RELAX_OK.and.q(2).lt.this%rhoG_min*(1.0_WP-pVF(i,j,k,1))
+               if (refused) then; pVF(i,j,k,1)=VFb; q(3:4)=Yb; end if
+               pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+q(3:4)-Yb
+               if (rerr.ne.RELAX_OK.or.refused) this%cnt%nrelax_fail=this%cnt%nrelax_fail+1.0_WP
             end if
             ! Check if mixture cell after relaxation
             newmix=(pVF(i,j,k,1).ge.VFlo.and.pVF(i,j,k,1).le.VFhi)
@@ -2660,27 +2937,64 @@ end subroutine get_cell_velocity
       call this%amr%mfiter_destroy(mfi)
       ! Sync and apply BC
       call this%VF%average_down(); call this%fill(lvl=this%amr%maxlvl,time=time)
-      call this%Q%average_down(); call this%Q%fill(time=time)
+      call this%restrict_Q(time)
       this%wt_relax=this%wt_relax+(MPI_Wtime()-tw0)
    contains
-      !> Positivity gate of mixed cell (i,j,k) (torrens), with q=[m_1,m_2,Y_1,Y_2] its masses and internal contents: a phase
-      !> without positive mass, internal content, or sound speed (p>-pinf) is removed, momentum and energy is rebuilt
-      subroutine gate_cell(i,j,k,q,gated)
+      !> Positivity gate (torrens) of cell (i,j,k) of level lvl, with q=[m_1,m_2,Y_1,Y_2] its masses and internal contents.
+      !> Mixed cell: a phase without positive mass or internal content is removed (momentum rebuilt at the kept velocity,
+      !> booked); a phase outside its law's domain (c<=0) is floored to its declared Tmin, or removed without one.
+      !> Pure cell: floored to its declared Tmin when below it; outside its law's domain without a declared Tmin, the run stops
+      subroutine gate_cell(lvl,i,j,k,q)
+         use messager, only: die
+         use string,   only: str_long
          implicit none
-         integer, intent(in) :: i,j,k
+         integer, intent(in) :: lvl,i,j,k
          real(WP), dimension(4), intent(in) :: q
-         logical, intent(out) :: gated
          logical :: badL,badG
          integer :: n,o,s
          real(WP) :: E0,old
-         badL=q(1).le.0.0_WP.or.q(3).le.0.0_WP
-         if (.not.badL) badL=this%liq%get_c_from_rho_e(rho=q(1)/pVF(i,j,k,1),e=q(3)/q(1),y=[1.0_WP]).le.0.0_WP
-         badG=q(2).le.0.0_WP.or.q(4).le.0.0_WP
-         if (.not.badG) badG=this%gas%get_c_from_rho_e(rho=q(2)/(1.0_WP-pVF(i,j,k,1)),e=q(4)/q(2),y=[1.0_WP]).le.0.0_WP
-         gated=badL.or.badG
-         if (.not.gated) return
+         real(WP), dimension(4) :: qq
+         real(WP), dimension(2) :: alp,Tmin
+         character(len=str_long) :: message
+         qq=q
+         alp=[pVF(i,j,k,1),1.0_WP-pVF(i,j,k,1)]
+         Tmin=[this%TminL,this%TminG]
+         if (pVF(i,j,k,1).lt.VFlo.or.pVF(i,j,k,1).gt.VFhi) then
+            ! Pure cell: its phase n
+            n=merge(1,2,pVF(i,j,k,1).gt.VFhi)
+            if (Tmin(n).gt.0.0_WP.and.qq(n).gt.0.0_WP) then
+               if (qq(2+n).le.0.0_WP) then
+                  call floor_phase(i,j,k,n,1.0_WP,qq)
+               else if (temperature(n,qq).lt.Tmin(n)) then
+                  call floor_phase(i,j,k,n,1.0_WP,qq)
+               end if
+            else if (.not.inside(n,1.0_WP,qq)) then
+               write(message,'("[amrmpcomp gate] pure ",a," cell outside its law''s domain and no Tmin declared: lvl=",i0," ijk=",3(i0,1x), &
+               &     "x=",3(es12.5,1x),"m=",es12.5," Y=",es12.5)') trim(merge('liquid','gas   ',n.eq.1)),lvl,i,j,k, &
+               &     [this%amr%xlo+(real(i,WP)+0.5_WP)*this%amr%dx(lvl),this%amr%ylo+(real(j,WP)+0.5_WP)*this%amr%dy(lvl), &
+               &      this%amr%zlo+(real(k,WP)+0.5_WP)*this%amr%dz(lvl)],qq(n),qq(2+n)
+               call die(trim(message))
+            end if
+            return
+         end if
+         ! Mixed cell: phases without mass or internal content are removed
+         badL=qq(1).le.0.0_WP.or.qq(3).le.0.0_WP
+         badG=qq(2).le.0.0_WP.or.qq(4).le.0.0_WP
+         ! Phases outside their law's domain are floored to their declared Tmin, or removed without one
+         do n=1,2
+            if (merge(badL,badG,n.eq.1)) cycle
+            if (inside(n,alp(n),qq)) cycle
+            if (Tmin(n).gt.0.0_WP) then
+               call floor_phase(i,j,k,n,alp(n),qq)
+            else if (n.eq.1) then
+               badL=.true.
+            else
+               badG=.true.
+            end if
+         end do
+         if (.not.(badL.or.badG)) return
          ! Remove phase n
-         n=2; if (badL.and.(.not.badG.or.q(1).le.q(2))) n=1
+         n=2; if (badL.and.(.not.badG.or.qq(1).le.qq(2))) n=1
          o=3-n
          E0=pQ(i,j,k,3)+pQ(i,j,k,4)
          this%cnt%ngate=this%cnt%ngate+1.0_WP
@@ -2697,9 +3011,61 @@ end subroutine get_cell_velocity
             this%cnt%gate_rhoW=this%cnt%gate_rhoW+(pRHOW(i,j,k+s,1)-old)*cell_vol
          end do
          ! The remaining phase owns the kinetic energy of the cell
-         pQ(i,j,k,2+o)=q(2+o)+cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+         pQ(i,j,k,2+o)=qq(2+o)+cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
          this%cnt%gate_energy=this%cnt%gate_energy+(E0-pQ(i,j,k,2+o))*cell_vol
       end subroutine gate_cell
+
+      !> Material of phase n (1 liquid, 2 gas)
+      function phase(n) result(mat)
+         implicit none
+         integer, intent(in) :: n
+         class(material), pointer :: mat
+         if (n.eq.1) then
+            mat=>this%liq
+         else
+            mat=>this%gas
+         end if
+      end function phase
+
+      !> Whether phase n of fraction a and content qq is inside its law's domain (positive internal content and sound speed)
+      logical function inside(n,a,qq)
+         implicit none
+         integer, intent(in) :: n
+         real(WP), intent(in) :: a
+         real(WP), dimension(4), intent(in) :: qq
+         class(material), pointer :: mat
+         inside=qq(n).gt.0.0_WP.and.qq(2+n).gt.0.0_WP
+         if (.not.inside) return
+         mat=>phase(n)
+         inside=mat%get_c_from_rho_e(rho=qq(n)/a,e=qq(2+n)/qq(n),y=[1.0_WP]).gt.0.0_WP
+      end function inside
+
+      !> Temperature of pure phase n of content qq
+      real(WP) function temperature(n,qq)
+         implicit none
+         integer, intent(in) :: n
+         real(WP), dimension(4), intent(in) :: qq
+         class(material), pointer :: mat
+         mat=>phase(n)
+         temperature=mat%get_T_from_rho_e(rho=qq(n),e=qq(2+n)/qq(n),y=[1.0_WP])
+      end function temperature
+
+      !> Raise the internal content of phase n (fraction a) of cell (i,j,k) to its value at the declared Tmin, booked
+      subroutine floor_phase(i,j,k,n,a,qq)
+         implicit none
+         integer, intent(in) :: i,j,k,n
+         real(WP), intent(in) :: a
+         real(WP), dimension(4), intent(inout) :: qq
+         real(WP) :: rho,Yf
+         class(material), pointer :: mat
+         mat=>phase(n)
+         rho=qq(n)/a
+         Yf=qq(n)*mat%get_e_from_p_rho(p=mat%get_p_from_rho_T(rho=rho,T=merge(this%TminL,this%TminG,n.eq.1),y=[1.0_WP]),rho=rho,y=[1.0_WP])
+         pQ(i,j,k,2+n)=pQ(i,j,k,2+n)+Yf-qq(2+n)
+         this%cnt%ngate_floor=this%cnt%ngate_floor+1.0_WP
+         this%cnt%gate_energy=this%cnt%gate_energy-(Yf-qq(2+n))*cell_vol
+         qq(2+n)=Yf
+      end subroutine floor_phase
    end subroutine apply_relax
 
    !> Add artificial bulk viscosity to this%beta (and optionally this%visc). The kinematic
@@ -2898,8 +3264,9 @@ end subroutine get_cell_velocity
       type(amrex_imultifab) :: mask
       integer, dimension(:,:,:,:), contiguous, pointer :: pMask
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pPL,pPG,pTL,pTG
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: prhoU,prhoV,prhoW,pU,pV,pW
-      real(WP), dimension(9) :: buf
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: prhoU,prhoV,prhoW,pU,pV,pW,pQ
+      real(WP), dimension(10) :: buf
+      real(WP), dimension(4) :: Qsum
 
       ! Use parent's method first (velocity, Q, and VF statistics)
       call this%amrmpflow%get_info()
@@ -2924,6 +3291,7 @@ end subroutine get_cell_velocity
       this%TLmin=huge(1.0_WP); this%TLmax=-huge(1.0_WP); this%TGmin=huge(1.0_WP); this%TGmax=-huge(1.0_WP)
       this%dPmax=0.0_WP
       this%rhoKint=0.0_WP
+      Qsum=0.0_WP
       do lvl=0,this%amr%clvl()
          ! Build fine mask for this level (if not finest)
          if (lvl.lt.this%amr%clvl()) then
@@ -2941,12 +3309,15 @@ end subroutine get_cell_velocity
             prhoU=>this%rhoU%mf(lvl)%dataptr(mfi); pU=>this%U%mf(lvl)%dataptr(mfi)
             prhoV=>this%rhoV%mf(lvl)%dataptr(mfi); pV=>this%V%mf(lvl)%dataptr(mfi)
             prhoW=>this%rhoW%mf(lvl)%dataptr(mfi); pW=>this%W%mf(lvl)%dataptr(mfi)
+            pQ=>this%Q%mf(lvl)%dataptr(mfi)
             if (lvl.lt.this%amr%clvl()) pMask=>mask%dataptr(mfi)
             ! Loop over interior tiles
             bx=mfi%tilebox()
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                ! Skip cells covered by finer level
                if (lvl.lt.this%amr%clvl()) then; if (pMask(i,j,k,1).eq.0) cycle; end if
+               ! Integrals of Q over uncovered cells (covered cells hold restricted internal contents, not averaged energies)
+               Qsum=Qsum+pQ(i,j,k,1:4)*this%amr%cell_vol(lvl)
                ! Liquid variables
                if (pVF(i,j,k,1).ge.VFlo) then
                   this%RHOLmin=min(this%RHOLmin,pRHOL(i,j,k,1)); this%RHOLmax=max(this%RHOLmax,pRHOL(i,j,k,1))
@@ -2981,13 +3352,14 @@ end subroutine get_cell_velocity
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%TGmin  ,1,MPI_REAL_WP,MPI_MIN,this%amr%comm,ierr); call MPI_ALLREDUCE(MPI_IN_PLACE,this%TGmax  ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%dPmax  ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%rhoKint,1,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,Qsum,4,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr); this%Qint=Qsum
 
       ! Diagnostic counts of the last calls, summed across ranks from this rank's values
       buf=[this%cnt%nvf_guard,this%cnt%nsliver,this%cnt%nrelax_fail,this%cnt%ngate,this%cnt%gate_mass,this%cnt%gate_energy, &
-      &    this%cnt%gate_rhoU,this%cnt%gate_rhoV,this%cnt%gate_rhoW]
-      call MPI_ALLREDUCE(MPI_IN_PLACE,buf,9,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
+      &    this%cnt%gate_rhoU,this%cnt%gate_rhoV,this%cnt%gate_rhoW,this%cnt%ngate_floor]
+      call MPI_ALLREDUCE(MPI_IN_PLACE,buf,10,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
       this%nvf_guard=buf(1); this%nsliver=buf(2); this%nrelax_fail=buf(3); this%ngate=buf(4); this%gate_mass=buf(5)
-      this%gate_energy=buf(6); this%gate_rhoU=buf(7); this%gate_rhoV=buf(8); this%gate_rhoW=buf(9)
+      this%gate_energy=buf(6); this%gate_rhoU=buf(7); this%gate_rhoV=buf(8); this%gate_rhoW=buf(9); this%ngate_floor=buf(10)
 
       ! Reduce per-rank timing to min/max across ranks
       call MPI_ALLREDUCE(this%wt_mid   ,this%wtmax_mid   ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr); call MPI_ALLREDUCE(this%wt_mid   ,this%wtmin_mid   ,1,MPI_REAL_WP,MPI_MIN,this%amr%comm,ierr)

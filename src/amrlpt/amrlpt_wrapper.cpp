@@ -1,6 +1,6 @@
 // amrlpt_wrapper.cpp
 // C++ bridge between Fortran amrlpt_class and AMReX NeighborParticleContainer
-// Particle struct: 14 extra reals (d, vel[3], angVel[3], Acol[3], Tcol[3], dt)
+// Particle struct: 16 extra reals (d, vel[3], angVel[3], Acol[3], Tcol[3], dt, mass, eint)
 //                  1 extra int   (flag)
 // All functions callable from Fortran via bind(C)
 //
@@ -32,18 +32,20 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <cstddef>
+#include <type_traits>
 
 using namespace amrex;
 
 // -----------------------------------------------------------------------
-// Particle container type: 14 extra reals, 1 extra int
+// Particle container type: 16 extra reals, 1 extra int
 // Full in-memory layout per particle (double precision):
 //   pos[3]     (24 B)  -- AMReX base
-//   rdata[14]  (112 B) -- d, vel[3], angVel[3], Acol[3], Tcol[3], dt
+//   rdata[16]  (128 B) -- d, vel[3], angVel[3], Acol[3], Tcol[3], dt, mass, eint
 //   idcpu      (8 B)   -- AMReX packed id+cpu
 //   idata[1]   (4 B)   -- flag
 // -----------------------------------------------------------------------
-#define AMRLPT_NREAL 14
+#define AMRLPT_NREAL 16
 #define AMRLPT_NINT 1
 
 namespace {
@@ -76,10 +78,21 @@ public:
 
 using PC = AMRLPTPC;
 using PT = PC::ParticleType;
+static_assert(AMREX_SPACEDIM == 3 && sizeof(ParticleReal) == 8,
+              "Fortran particle bridge requires 3D, double-precision particles");
+static_assert(std::is_standard_layout<PT>::value && sizeof(PT) == 168,
+              "Particle<16,1> no longer matches the Fortran bind(C) layout");
+static_assert(offsetof(PT, m_rdata) == 24 && offsetof(PT, m_idcpu) == 152 &&
+              offsetof(PT, m_idata) == 160, "Particle member offsets changed");
+constexpr const char* layout_file = "NGA2ParticleLayout";
+constexpr const char* layout_tag = "NGA2_AMRLPT_MASS_EINT";
+constexpr int layout_version = 1;
 
 } // namespace
 
 extern "C" {
+
+std::size_t amrlpt_particle_size() { return sizeof(PT); }
 
 // -----------------------------------------------------------------------
 // Lifecycle
@@ -458,6 +471,14 @@ void amrlpt_write(PC *pc, const char *fullpath, int is_chk) {
   std::string leaf = (pos != std::string::npos) ? path.substr(pos + 1) : path;
   amrex::PreBuildDirectorHierarchy(parent, "", 1, true);
   pc->Checkpoint(parent, leaf, is_chk != 0);
+  if (ParallelDescriptor::IOProcessor()) {
+    std::ofstream schema(path + "/" + layout_file);
+    schema << layout_tag << ' ' << layout_version << ' ' << AMRLPT_NREAL
+           << ' ' << AMRLPT_NINT << '\n';
+    schema.close();
+    if (!schema) amrex::Abort("amrlpt_write: failed to write particle layout metadata");
+  }
+  ParallelDescriptor::Barrier();
 }
 
 // -----------------------------------------------------------------------
@@ -465,7 +486,7 @@ void amrlpt_write(PC *pc, const char *fullpath, int is_chk) {
 // write_real[AMRLPT_NREAL]: bitmask (1=write, 0=skip) for each extra real.
 // write_int[AMRLPT_NINT]:   bitmask for each extra int.
 // Component names are hardcoded here to match the Fortran part struct layout:
-//   rdata[0..13]: d, vx, vy, vz, wx, wy, wz, ax, ay, az, tx, ty, tz, dt
+//   rdata[0..15]: d, vx, vy, vz, wx, wy, wz, ax, ay, az, tx, ty, tz, dt, mass, eint
 //   idata[0]:     flag
 // Position (pos[3]) is always written by AMReX (baked into particle format).
 // -----------------------------------------------------------------------
@@ -475,7 +496,7 @@ void amrlpt_write_plotfile(PC *pc, const char *basedir, const char *pname,
                            double time) {
   static const Vector<std::string> rnames = {"d",  "vx", "vy", "vz", "wx",
                                              "wy", "wz", "ax", "ay", "az",
-                                             "tx", "ty", "tz", "dt"};
+                                             "tx", "ty", "tz", "dt", "mass", "eint"};
   static const Vector<std::string> inames = {"flag"};
 
   Vector<int> wr(write_real, write_real + AMRLPT_NREAL);
@@ -518,6 +539,18 @@ void amrlpt_read(PC *pc, const char *fullpath) {
   std::string parent =
       (pos != std::string::npos) ? path.substr(0, pos) : std::string(".");
   std::string leaf = (pos != std::string::npos) ? path.substr(pos + 1) : path;
+  // Reject pre-mass/eint checkpoints before AMReX interprets their particle payload.
+  std::ifstream schema(path + "/" + layout_file);
+  std::string tag;
+  int version = 0, nr = 0, ni = 0;
+  if (!(schema >> tag >> version >> nr >> ni) || tag != layout_tag ||
+      version != layout_version || nr != AMRLPT_NREAL || ni != AMRLPT_NINT) {
+    amrex::Abort("amrlpt_read: incompatible particle checkpoint layout; expected "
+                 "MASS_EINT v1 (16 reals, 1 integer). Legacy 14-real checkpoints "
+                 "require explicit migration; start a fresh run.");
+  }
+  // Restart replaces the current state, including when called on a populated container.
+  pc->clearParticles();
   pc->Restart(parent, leaf);
 }
 

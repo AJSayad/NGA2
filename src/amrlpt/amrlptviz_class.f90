@@ -41,6 +41,8 @@ module amrlptviz_class
    ! rdata[7..9] = Acol (ax,ay,az)
    ! rdata[10..12]= Tcol (tx,ty,tz)
    ! rdata[13]   = dt
+   ! rdata[14]   = mass
+   ! rdata[15]   = eint (specific internal energy)
    ! idata[0]    = flag
 
    type :: amrlptviz
@@ -129,7 +131,7 @@ contains
    end subroutine initialize
 
    !> Toggle a named field group on or off.
-   !> Names: 'd', 'vel', 'angVel', 'Acol', 'Tcol', 'dt', 'flag'
+   !> Names: 'd', 'vel', 'angVel', 'Acol', 'Tcol', 'dt', 'mass', 'eint', 'flag'
    !> You can also pass individual component names: 'vx','vy','vz' etc.
    subroutine select_comp(this, name, on)
       implicit none
@@ -178,6 +180,10 @@ contains
          this%write_real(13) = val
       case('dt')
          this%write_real(14) = val
+      case('mass')
+         this%write_real(15) = val
+      case('eint')
+         this%write_real(16) = val
       ! Integer components
       case('flag')
          this%write_int(1) = val

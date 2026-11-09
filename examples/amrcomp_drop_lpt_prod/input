@@ -79,6 +79,9 @@ Sutherland temperature: 0.07286
 Max dt:   1e-3
 Max CFL:  0.75
 Subiterations: 3       ! Iterative midpoint sub-iterations (2 = explicit midpoint RK2, unstable on the imaginary axis)
+# Positivity gate temperature floors (0: undeclared; initial TL=TG~0.196)
+Liquid Tmin: 0.0
+Gas Tmin:    0.0
 Max time: 100
 
 # Output
@@ -92,34 +95,33 @@ Restart from:      !restart/drop_6.00000E+00
 # ---------------------------------------------------------------------
 # Sub-grid drop -> Lagrangian particle transfer
 #
-# A liquid structure is handed to the spray when it is BOTH
-#   (a) smaller than 'Drop transfer volume coeff' cell volumes at the finest level, and
-#   (b) outside the parent drop's bounding box grown by 'Drop transfer margin'.
-# The box is measured from the largest structure (amrccl guarantees that is id=1) using cell
-# corners; directions resolved by a single cell are ignored, so in quasi-2D the z direction
-# never disqualifies anything. This case is NON-DIMENSIONAL with d0 = 1, so the default margin
-# of 0.5*d0 is simply 0.5 in code units.
+# Detached non-core components wholly on the finest level can transfer at any distance
+# from the core, when their equivalent-volume diameter is at most the configured maximum.
+# Refill requires component donor cells with at least 50% gas; no donors means no removal.
 #
-# COUPLING is two-way for momentum, deposited into the gas via lp%src -> face momenta. The energy
-# dissipated by drag (lp%src(4)) is currently NOT added to the gas energy Q(4). Convective (Gunn) heat transfer is written up but
-# COMMENTED OUT in four places - see 'GUNN HEAT TRANSFER (disabled)' in src/simulation.f90 and
-# in src/amrlpt/amrlpt_class.f90; enabling it needs the Particle<14,1> -> <15,1> layout change
-# documented there. MASS is one-way by nature: liquid that becomes a particle is gone from the
-# Eulerian field, as there is no phase-change model. monitor/spray carries the whole ledger.
+# COUPLING returns momentum and total energy to the fluid. The mechanical part of src(4)
+# is minus the hydrodynamic impulse dotted with the particle endpoint-average velocity;
+# the thermal part is minus the accepted particle internal-energy change. Mechanical work
+# includes resolved stress. Drag dissipation is monitored separately and is not added twice.
+# Converted particles carry the removed mass and total energy (translation plus internal
+# energy). Gunn particle heat exchange is enabled, using the liquid EOS and k_g=mu_g*cp_g/Pr.
+# Gunn porosity is fixed at 1; Eulerian gas fraction still weights sampled gas properties.
+# The existing midpoint push limits thermal substeps to half the local thermal response time.
+# There is no evaporation/phase-change model. Particle mass and diameter stay fixed after birth.
+# Gas sampling retains every positive usable gas fraction, normalized over the stencil.
+# A gas-free stencil culls the last accepted particle state; separate loss ledgers
+# book mass, momentum and total energy. No liquid-drag fallback or reabsorption.
 #
-# With volume coeff 24 and particle level offset 3, the largest equivalent sphere has
-# d/h_couple ~ 0.447 for the supplied geometry. Additional diffusion defaults to zero;
-# coarse trilinear deposition still spreads the reaction over the coupling stencil.
-# In this quasi-2D setup the maximum particle volume is 0.375 coupling-cell volumes.
-# Diameter ratio alone does not establish small self-disturbance or dilute local loading.
+# Additional source diffusion defaults to zero; trilinear deposition spreads the reaction
+# over the coupling stencil. Diameter ratio alone does not establish dilute local loading.
 # ---------------------------------------------------------------------
 Drop transfer:              .true.
-Drop transfer volume coeff: 24
-# As in shock_droplet, eligible structures with an equal-volume diameter below
-# this fraction of the receiving particle-grid spacing are discarded as flotsams.
+Drop transfer maximum diameter ratio: 1.0
+# Minimum diameter / finest-grid spacing (formerly coupling-grid units).
+# Eligible structures strictly below this limit are flotsam; zero disables this size cull.
 Drop transfer diameter threshold: 0.1
 Drop transfer nsteps:       10
-# Clearance beyond the core's bounding box; comment out to use the default of 0.5*d0 = 0.5
+# Core-box padding for wake tagging only; no transfer proximity restriction.
 !Drop transfer margin:      0.5
 
 # Spray solver
@@ -131,13 +133,11 @@ Drop transfer nsteps:       10
 # pure-liquid cells have zero weight, and a gas-free particle stencil is an error.
 # Levels below 'Max level' that particles are capped to. The cap coarsens BOTH fluid
 # sampling and source deposition; the reaction is transferred to finer fluid levels.
-# For volume coeff 24 in the supplied geometry, the maximum diameter ratios are:
-#   offset 0: d/h ~ 3.58
-#   offset 2: d/h ~ 0.895
-#   offset 3: d/h ~ 0.447 (default)
+# The maximum transfer diameter is 'Drop transfer maximum diameter ratio' times
+# the minimum spacing at the particle level cap. The default ratio is 1.0.
 # The initialization check rejects a transfer threshold that exceeds 'Particle maximum d/dx'.
 # Watch 'd/dx couple' in monitor/spray to confirm the configured upper bound.
-Particle level offset: 3
+Particle level offset: 2
 Particle maximum d/dx: 1.0
 
 Particle drag model:  Osnes
@@ -146,7 +146,6 @@ Particle max CFL:     0.5
 !Particle filter width: 0.5
 Particle collisions:  .false.
 !Particle collision time: 1e-2
-!Particle Cp:         1.0
 !Spray output period: 1e-1
 
 # ---------------------------------------------------------------------
@@ -163,9 +162,9 @@ Particle collisions:  .false.
 #                   * 2^((x - x_start)/Wake tag length)          for x beyond x_start
 #
 # Both multipliers apply only for x > x_start; upstream the original thresholds are retained.
-# Here x_start = max(Wake tag x0, downstream face of the transfer box). The ramp can never begin
-# upstream of the transfer boundary: inside that region drops are still tracked as VOF structures
-# rather than handed to the spray, so it is exactly the region that has to stay refined.
+# Here x_start = max(Wake tag x0, downstream face of the padded core box).
+# This protects the primary-drop region from wake coarsening. The box does not restrict
+# transfer: eligible detached structures can transfer at any distance from the core.
 #
 # 'Wake max level offset' is a true relative cap on refinement requested by the SGS-Re criterion
 # and, when 'Wake tag density' is true, by the density criterion inside the wake.  Other criteria

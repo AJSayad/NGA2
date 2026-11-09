@@ -73,6 +73,9 @@ Sponge rate:   1.0
 Max dt:   1e-3
 Max CFL:  0.5
 Subiterations: 3       ! Iterative midpoint sub-iterations (2 = explicit midpoint)
+# Positivity gate temperature floors (0: undeclared; initial TL=TG~0.196)
+Liquid Tmin: 0.0
+Gas Tmin:    0.0
 Max time: 100
 
 # Output
