@@ -30,18 +30,9 @@ Liquid right: 0.75
 
 # Time integration
 Max dt:   1.25e-6
-Max CFL:  0.8
+Max CFL:  0.5
 Max time: 1.25e-4
 Subiterations: 3
-
-# CTU threshold
-CTU alpha: 0.5
-
-# No shocks: no artificial bulk viscosity
-Artificial viscosity coefficient: 0.0
-
-# Pressure relaxation from the first step
-Relaxation start time: 0.0
 
 # Output
 Output period: 1.0e-3

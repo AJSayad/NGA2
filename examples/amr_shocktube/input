@@ -12,16 +12,16 @@ PinfL:  3.43e8
 CvG: 718.0
 CvL: 4184.0
 
-# Gas state (right side, x >= 0.8)
+# Gas state (right side, x >= 0.8025)
 Gas density:   20.0
 Gas pressure:  1.0e5
 
-# Liquid state (left side, x < 0.8)
+# Liquid state (left side, x < 0.8025)
 Liquid density:  1000.0
 Liquid pressure: 1.0e9
 
-# Interface location
-Interface location: 0.8
+# Interface location: on a cell face for Base nx 400 and 2000 (no initial mixed cell)
+Interface location: 0.8025
 
 # Time integration
 Max dt:   1.25e-6 # 1.25e-6  # 2.5e-7

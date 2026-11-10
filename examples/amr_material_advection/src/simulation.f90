@@ -1,10 +1,4 @@
-!> 1D multiphase material advection simulation with amr code, using the staggered compressible multiphase
-!> solver (amrmpcomp_class.f90) and NGA2's iterative midpoint time integration: each sub-iteration evaluates
-!> one RHS at the midpoint of the start-of-step state and the current iterate, then Q=Qold+dt*dQdt, followed
-!> by PLIC reconstruction and relaxation of the new iterate. A liquid slab in gas, both at the same pressure
-!> and velocity, so the exact solution is the translated initial profile. With 'Liquid shape: sphere' and a 3D grid, the
-!> liquid is a sphere of radius (xL2-xL1)/2 at the centre of the unit periodic box, advected along x or along the diagonal
-!> ('Velocity direction'); the velocity errors then cover all three face components.
+!> 1D multiphase material advection simulation
 module simulation
    use precision,           only: WP
    use string,              only: str_medium
@@ -16,7 +10,8 @@ module simulation
    use event_class,         only: event
    use monitor_class,       only: monitor
    use stiffened_gas_class, only: stiffened_gas
-   use relax_isentropic_class, only: relax_isentropic
+   use nasg_class,          only: nasg
+   use relax_ig_nasg_class, only: relax_ig_nasg,Prelax
    implicit none
    private
 
@@ -37,8 +32,7 @@ module simulation
    !> Simulation monitoring
    type(monitor) :: mfile,consfile,cflfile,gridfile
 
-   !> Errors against the exact (uniform) velocity and pressure: max over the faces of each direction d of |U_d-u0_d|/|u0|,
-   !> with u0 the advection velocity, and max over cells of |P-p0|/p0
+   !> Errors against the exact (uniform) velocity and pressure
    real(WP) :: errU,errP
 
    !> Liquid shape (slab or sphere) and advection velocity components
@@ -49,16 +43,16 @@ module simulation
    real(WP) :: Etot=0.0_WP,Etot0=0.0_WP,dEtot=0.0_WP   !< Mixture total energy, initial value, relative drift
 
    !> Materials
-   type(stiffened_gas), target :: water
+   type(nasg),          target :: water   !< Stiffened gas: NASG with zero co-volume
    type(stiffened_gas), target :: air
 
    !> Relaxation model
-   type(relax_isentropic), target :: relax_model
+   type(relax_ig_nasg), target :: relax_model
 
    !> Flow parameters
-   real(WP) :: rhoG                    !< Gas density (outside liquid region)
-   real(WP) :: rhoL                    !< Liquid density (inside liquid region)
-   real(WP) :: p_init                  !< Initial pressure - identical in both phases
+   real(WP) :: rhoG                    !< Gas density 
+   real(WP) :: rhoL                    !< Liquid density
+   real(WP) :: p_init                  !< Initial pressure
    real(WP) :: u_init                  !< Initial uniform advection velocity
    real(WP) :: xL1,xL2                 !< Liquid slab bounds
    real(WP), dimension(3) :: center    !< Center of the liquid region
@@ -67,13 +61,9 @@ module simulation
    !> Artificial bulk viscosity coefficient and viscous CFL clipping
    real(WP) :: Cartif,max_visc_cfl
 
-   !> Relaxation is held off until this time
-   real(WP) :: relax_start
-
 contains
 
    !> Levelset function for a liquid slab of half-width radius centered on center(1)
-   !> Returns positive for liquid (inside the slab), negative for gas (outside)
    function slab_levelset(xyz,t) result(G)
       real(WP), dimension(3), intent(in) :: xyz
       real(WP), intent(in) :: t
@@ -81,7 +71,7 @@ contains
       G=radius-abs(xyz(1)-center(1))
    end function slab_levelset
 
-   !!> Levelset function for a liquid circle of radius radius centered on center - for 2D extension
+   !!> Levelset function for a liquid circle of radius radius centered on center
    !function circle_levelset(xyz,t) result(G)
    !   real(WP), dimension(3), intent(in) :: xyz
    !   real(WP), intent(in) :: t
@@ -89,7 +79,7 @@ contains
    !   G=radius-sqrt((xyz(1)-center(1))**2+(xyz(2)-center(2))**2)
    !end function circle_levelset
 
-   !> Levelset function for a liquid sphere of radius radius centered on center
+   !> Levelset function for a liquid sphere
    function sphere_levelset(xyz,t) result(G)
       real(WP), dimension(3), intent(in) :: xyz
       real(WP), intent(in) :: t
@@ -97,7 +87,7 @@ contains
       G=radius-sqrt((xyz(1)-center(1))**2+(xyz(2)-center(2))**2+(xyz(3)-center(3))**2)
    end function sphere_levelset
 
-   !> Inviscid: zero out transport coefficients (artificial viscosity is added separately)
+   !> Inviscid: zero out transport coefficients 
    subroutine get_viscosities()
       implicit none
       call fs%visc%setval(val=0.0_WP)
@@ -105,8 +95,6 @@ contains
    end subroutine get_viscosities
 
    !> User init callback - set Q, VF, barycenters, and x-face velocity for material advection
-   !> Liquid slab inside [xL1,xL2], gas outside, both at the same pressure and velocity.
-   !> Momentum is built from the face velocity by post_regrid.
    subroutine advection_init(solver,lvl,time,ba,dm)
       use amrex_amr_module, only: amrex_boxarray,amrex_distromap,amrex_mfiter,amrex_box
       use amrex_amr_module, only: amrex_mfiter_build,amrex_mfiter_destroy
@@ -231,10 +219,6 @@ contains
          call param_read('Base nx',amr%nx)
          call param_read('Base ny',amr%ny)
          call param_read('Base nz',amr%nz)
-         ! DIAGNOSTIC: domain origin is settable so the same physics can be run at a different
-         ! absolute coordinate magnitude. The SL geometry differences vertex positions of size
-         ! O(|x|) to obtain lengths O(dx), so if its precision goes like eps*|x|/dx the error
-         ! must scale with the origin. Defaults reproduce the original [0,1] domain exactly.
          call param_read('Domain xlo',amr%xlo,default=0.0_WP)
          amr%xhi=amr%xlo+1.0_WP
          amr%ylo=0.0_WP; amr%yhi=+1.0_WP
@@ -266,8 +250,7 @@ contains
          call param_read('Max time',time%tmax)
          call param_read('Max dt',time%dtmax)
          call param_read('Max CFL',time%cflmax)
-         ! Iterative midpoint sub-iterations: 2 is explicit midpoint RK2, unstable on the imaginary axis;
-         ! 3 or more is stable for |lambda*dt|<=2
+         ! Iterative midpoint sub-iterations
          call param_read('Subiterations',time%itmax,default=3)
          if (time%itmax.lt.1) call die('Require at least one sub-iteration')
          time%dt=time%dtmax
@@ -277,9 +260,15 @@ contains
       create_solver: block
          ! Assign materials
          fs%liq=>water; fs%gas=>air
-         ! Provide pressure relaxation model (gas-isentropic)
+         ! Provide pressure relaxation model (mechanical only, no thermal relaxation); Prelax assumes an ideal gas
+         if (air%pinf.ne.0.0_WP) call die('[simulation_init] Prelax relaxation requires PinfG=0')
          call relax_model%initialize(gas=air,liq=water); fs%relax=>relax_model
-         call param_read('Relaxation start time',relax_start,default=0.0_WP)
+         relax_model%model=Prelax
+         ! Refuse relaxations that leave the gas below 1e-2; the model's own RHOGmin keeps its 1e-2 default
+         fs%rhoG_min=1.0e-2_WP
+         ! Positivity gate temperature floors
+         call param_read('Liquid Tmin',fs%TminL,default=0.0_WP)
+         call param_read('Gas Tmin'   ,fs%TminG,default=0.0_WP)
          ! Band momentum flux: CTU below the staggered phase fraction CTU alpha, MC elsewhere
          call param_read('CTU alpha',fs%alpha_ctu,default=0.5_WP)
          ! No VF treatment: build_plic and relaxation keep the transported VF
@@ -304,7 +293,7 @@ contains
 
       ! Initialize grid (no regridding for uniform mesh)
       init_grid: block
-         ! Artificial bulk viscosity: off by default, there are no shocks
+         ! Artificial bulk viscosity: off for this case
          call param_read('Artificial viscosity coefficient',Cartif,default=0.0_WP)
          call param_read('Max viscous CFL',max_visc_cfl,default=0.5_WP)
          if (Cartif.lt.0.0_WP.or.max_visc_cfl.le.0.0_WP) call die('Invalid artificial viscosity parameters')
@@ -417,6 +406,7 @@ contains
          call consfile%add_column(fs%gate_mass,'Gate mass')
          call consfile%add_column(fs%gate_energy,'Gate energy')
          call consfile%add_column(fs%gate_rhoU,'Gate U momentum')
+         call consfile%add_column(fs%ngate_floor,'Gate floors')
          call consfile%write()
          ! Create grid monitor
          gridfile=monitor(amRoot=amr%amRoot,name='grid')
@@ -448,7 +438,7 @@ contains
          ! Remember old state
          call fs%store_old()
 
-         ! Transport coefficients from the start-of-step state: inviscid, with optional artificial bulk viscosity
+         ! Transport coefficients from the start-of-step state
          call get_viscosities()
          call fs%add_viscartif(dt=time%dt,Cartif=Cartif,max_cfl=max_visc_cfl)
 
@@ -471,11 +461,11 @@ contains
             ! Phasic total energies of the new iterate: transported internal energy, phasic work, and kinetic energy
             call fs%get_energy(dt=time%dt,time=time%t)
 
-            ! Rebuild PLIC of the new iterate (the band sweep only uses the old PLIC)
+            ! Rebuild PLIC of the new iterate
             call fs%build_plic(time=time%t)
 
-            ! Get most up-to-date pressure: the last sub-iteration's relaxation is the end-of-step one
-            if (time%t.ge.relax_start) call fs%apply_relax(dt=time%dt,time=time%t)
+            ! Get most up-to-date pressure
+            call fs%apply_relax(dt=time%dt,time=time%t)
 
             ! Get primitive variables of the new iterate
             call fs%get_primitive(Q=fs%Q,rhoU=fs%rhoU,rhoV=fs%rhoV,rhoW=fs%rhoW,time=time%t)
@@ -485,9 +475,6 @@ contains
 
          end do
          ! =================================================================================
-
-         ! Stop on nonfinite or negative state
-         call check_state()
 
          ! Visualization output
          if (viz_evt%occurs()) then
@@ -628,8 +615,7 @@ contains
 
    end subroutine simulation_run
 
-   !> Maximum relative errors on level 0: |U_d-u0_d|/|u0| over the valid faces of each direction d, |P-p0|/p0 over valid
-   !> cells
+   !> Maximum relative errors on level 0: |U_d-u0_d|/|u0| over the valid faces of each direction d, |P-p0|/p0 over valid cells
    subroutine get_errors()
       use amrex_amr_module, only: amrex_mfiter,amrex_box
       use mpi_f08,  only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_MAX
@@ -669,32 +655,6 @@ contains
       call MPI_ALLREDUCE(MPI_IN_PLACE,err,2,MPI_REAL_WP,MPI_MAX,amr%comm,ierr)
       errU=err(1); errP=err(2)
    end subroutine get_errors
-
-   !> Stop if any cell has a nonfinite state or negative phasic mass
-   subroutine check_state()
-      use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
-      use amrex_amr_module, only: amrex_mfiter,amrex_box
-      use mpi_f08,  only: MPI_ALLREDUCE,MPI_IN_PLACE,MPI_INTEGER,MPI_MAX
-      use messager, only: die
-      type(amrex_mfiter) :: mfi
-      type(amrex_box) :: bx
-      real(WP), contiguous, pointer :: pQ(:,:,:,:),pP(:,:,:,:)
-      integer :: bad,ierr,i,j,k,lvl
-      bad=0
-      do lvl=0,amr%clvl()
-         call amr%mfiter_build(lvl,mfi)
-         do while(mfi%next())
-            bx=mfi%tilebox(); pQ=>fs%Q%mf(lvl)%dataptr(mfi); pP=>fs%P%mf(lvl)%dataptr(mfi)
-            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
-               if (.not.all(ieee_is_finite(pQ(i,j,k,:))).or..not.ieee_is_finite(pP(i,j,k,1))) bad=1
-               if (min(pQ(i,j,k,1),pQ(i,j,k,2)).lt.0.0_WP) bad=1
-            end do; end do; end do
-         end do
-         call amr%mfiter_destroy(mfi)
-      end do
-      call MPI_ALLREDUCE(MPI_IN_PLACE,bad,1,MPI_INTEGER,MPI_MAX,amr%comm,ierr)
-      if (bad.ne.0) call die('Nonfinite state or negative phasic mass: reduce dt/CFL')
-   end subroutine check_state
 
    !> Finalize the NGA2 simulation
    subroutine simulation_final

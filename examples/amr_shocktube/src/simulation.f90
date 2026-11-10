@@ -9,9 +9,9 @@ module simulation
    use timetracker_class,   only: timetracker
    use event_class,         only: event
    use monitor_class,       only: monitor
-   use stiffened_gas_class, only: stiffened_gas
+   use nasg_class,          only: nasg
    use ideal_gas_class,     only: ideal_gas
-   use relax_isentropic_class, only: relax_isentropic
+   use relax_ig_nasg_class, only: relax_ig_nasg,Prelax
    implicit none
    private
 
@@ -42,11 +42,11 @@ module simulation
    real(WP) :: Etot=0.0_WP,Etot0=0.0_WP,dEtot=0.0_WP   !< Mixture total energy, initial value, relative drift
 
    !> Materials
-   type(stiffened_gas), target :: water
-   type(ideal_gas),     target :: air
+   type(nasg),      target :: water   !< Stiffened gas: NASG with zero co-volume
+   type(ideal_gas), target :: air
 
    !> Relaxation model
-   type(relax_isentropic), target :: relax_model
+   type(relax_ig_nasg), target :: relax_model
 
    !> Flow parameters
    real(WP) :: rhoG,pG_init            !< Gas state (right side)
@@ -213,9 +213,10 @@ contains
          use amrmpcomp_class,  only: BC_GAS,BC_LIQ
          ! Assign materials
          fs%liq=>water; fs%gas=>air
-         ! Provide pressure relaxation model (gas-isentropic)
+         ! Provide pressure relaxation model (mechanical only, no thermal relaxation)
          call relax_model%initialize(gas=air,liq=water); fs%relax=>relax_model
-         ! Refuse relaxations that leave the gas below 1e-2
+         relax_model%model=Prelax
+         ! Refuse relaxations that leave the gas below 1e-2; the model's own RHOGmin keeps its 1e-2 default
          fs%rhoG_min=1.0e-2_WP
          ! Positivity gate temperature floors (0: undeclared, a pure cell outside its law's domain stops the run)
          call param_read('Liquid Tmin',fs%TminL,default=0.0_WP)
@@ -591,8 +592,7 @@ contains
 
    end subroutine simulation_run
 
-   !> Change between two sub-iterates (level 0, L-infinity), relative to the new iterate: maximum over
-   !> the Q components, and x-momentum. Overwrites Qprev and rhoUprev with the differences.
+   !> Change between two sub-iterates (level 0, L-infinity), relative to the new iterate
    subroutine get_convergence()
       implicit none
       integer :: n
