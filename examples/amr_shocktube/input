@@ -8,7 +8,7 @@ GammaG: 1.4
 GammaL: 6.12
 PinfL:  3.43e8
 
-# Specific heats [J/(kg·K)]
+# Specific heats [J/(kg·K)], not really used.
 CvG: 718.0
 CvL: 4184.0
 
@@ -25,18 +25,9 @@ Interface location: 0.8
 
 # Time integration
 Max dt:   1.25e-6 # 1.25e-6  # 2.5e-7
-Max CFL:  0.8
+Max CFL:  0.5
 Max time: 3e-4
 Subiterations: 3
-
-# CTU threshold
-CTU alpha: 0.5
-
-# Artificial bulk viscosity (keep on for shocks)
-Artificial viscosity coefficient: 5.0
-
-# Pressure relaxation from the first step
-Relaxation start time: 3e-6 #1.3e-6 #3e-6 # 3e-6  # 5e-7
 
 # Output
 Output period: 1.0e-5

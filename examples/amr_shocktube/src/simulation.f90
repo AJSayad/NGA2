@@ -56,9 +56,6 @@ module simulation
    !> Artificial bulk viscosity coefficient and viscous CFL clipping
    real(WP) :: Cartif,max_visc_cfl
 
-   !> Relaxation is held off until this time
-   real(WP) :: relax_start
-
 contains
 
    !> Levelset function for planar interface at x = x_int
@@ -218,7 +215,11 @@ contains
          fs%liq=>water; fs%gas=>air
          ! Provide pressure relaxation model (gas-isentropic)
          call relax_model%initialize(gas=air,liq=water); fs%relax=>relax_model
-         call param_read('Relaxation start time',relax_start,default=5.0e-6_WP)
+         ! Refuse relaxations that leave the gas below 1e-2
+         fs%rhoG_min=1.0e-2_WP
+         ! Positivity gate temperature floors (0: undeclared, a pure cell outside its law's domain stops the run)
+         call param_read('Liquid Tmin',fs%TminL,default=0.0_WP)
+         call param_read('Gas Tmin'   ,fs%TminG,default=0.0_WP)
          ! Band momentum flux: CTU below the staggered phase fraction CTU alpha, MC elsewhere
          call param_read('CTU alpha',fs%alpha_ctu,default=0.5_WP)
          ! No VF treatment: build_plic and relaxation keep the transported VF
@@ -366,6 +367,7 @@ contains
          call consfile%add_column(fs%gate_mass,'Gate mass')
          call consfile%add_column(fs%gate_energy,'Gate energy')
          call consfile%add_column(fs%gate_rhoU,'Gate U momentum')
+         call consfile%add_column(fs%ngate_floor,'Gate floors')
          call consfile%write()
          ! Create grid monitor
          gridfile=monitor(amRoot=amr%amRoot,name='grid')
@@ -437,7 +439,7 @@ contains
             ! call fs%add_surface_tension(scale=time%dt)
 
             ! Get most up-to-date pressure: the last sub-iteration's relaxation is the end-of-step one
-            if (time%t.ge.relax_start) call fs%apply_relax(dt=time%dt,time=time%t)
+            call fs%apply_relax(dt=time%dt,time=time%t)
 
             ! Get primitive variables of the new iterate
             call fs%get_primitive(Q=fs%Q,rhoU=fs%rhoU,rhoV=fs%rhoV,rhoW=fs%rhoW,time=time%t)
