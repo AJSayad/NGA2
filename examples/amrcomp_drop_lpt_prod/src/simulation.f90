@@ -657,6 +657,7 @@ contains
                   pC(i,j,k,1)=sqrt((pQ(i,j,k,1)*cL**2+pQ(i,j,k,2)*cG**2)/max(pQ(i,j,k,1)+pQ(i,j,k,2),solver%rho_floor))
                end do; end do; end do
       end do
+      call amrex_mfiter_destroy(mfi)
    end subroutine shockdrop_init
 
    !> Apply the inflow BC at low-x (boundary momentum comes from apply_momentum_bc)
