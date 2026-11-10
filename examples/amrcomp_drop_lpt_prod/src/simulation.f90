@@ -642,6 +642,21 @@ contains
                end do; end do; end do
       end do
       call amrex_mfiter_destroy(mfi)
+      ! Set mixture sound speed
+      cL=water%get_c_from_p_rho(p=pL1,rho=rhoL1,y=[1.0_WP])
+      call amrex_mfiter_build(mfi,ba,dm,tiling=.false.)
+      do while (mfi%next())
+         pQ=>solver%Q%mf(lvl)%dataptr(mfi)
+         pC=>solver%C%mf(lvl)%dataptr(mfi)
+         do k=lbound(pC,3),ubound(pC,3); do j=lbound(pC,2),ubound(pC,2); do i=lbound(pC,1),ubound(pC,1)
+                  x_cc=solver%amr%xlo+(real(i,WP)+0.5_WP)*dx
+                  H=Hshock(x=Xs-x_cc,delta=0.5_WP*dx)
+                  rhoG=rhoG1+(rhoG2-rhoG1)*H
+                  pG  =pG1  +(pG2  -pG1  )*H
+                  cG=gas%get_c_from_p_rho(p=pG,rho=rhoG,y=[1.0_WP])
+                  pC(i,j,k,1)=sqrt((pQ(i,j,k,1)*cL**2+pQ(i,j,k,2)*cG**2)/max(pQ(i,j,k,1)+pQ(i,j,k,2),solver%rho_floor))
+               end do; end do; end do
+      end do
    end subroutine shockdrop_init
 
    !> Apply the inflow BC at low-x (boundary momentum comes from apply_momentum_bc)
