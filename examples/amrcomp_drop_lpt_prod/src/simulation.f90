@@ -585,9 +585,9 @@ contains
       type(amrex_distromap), intent(in) :: dm
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pCL,pCG,pU
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pCL,pCG,pU,pC
       real(WP), dimension(3) :: BL,BG
-      real(WP) :: dx,dy,dz,myVF,IEL,x_cc,rhoG,pG,H
+      real(WP) :: dx,dy,dz,myVF,IEL,x_cc,rhoG,pG,H,cL,cG
       integer :: i,j,k
       integer, parameter :: nref=3
       ! Get mesh size
