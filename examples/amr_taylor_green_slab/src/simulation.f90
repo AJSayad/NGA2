@@ -9,6 +9,7 @@ module simulation
    use timetracker_class,   only: timetracker
    use event_class,         only: event
    use monitor_class,       only: monitor
+   use amrio_class,         only: amrio
    use stiffened_gas_class, only: stiffened_gas
    use nasg_class,          only: nasg
    use relax_ig_nasg_class, only: relax_ig_nasg,Prelax
@@ -28,6 +29,14 @@ module simulation
    !> Visualization
    type(event) :: viz_evt
    type(amrviz) :: viz
+
+   ! Restart parameters
+   type(amrio) :: io
+   type(event) :: save_evt
+   character(len=str_medium) :: restart_dir
+   logical :: restarted
+   integer :: restart_step=0
+   real(WP) :: restart_time
 
    !> Simulation monitoring
    type(monitor) :: mfile,consfile,cflfile,gridfile
@@ -195,6 +204,17 @@ contains
          center=0.5_WP*[amr%xlo+amr%xhi,amr%ylo+amr%yhi,amr%zlo+amr%zhi]
       end block create_amrgrid
 
+      ! Handle restart/saves here
+      handle_restart: block
+         ! Initialize IO object
+         call io%initialize(amr=amr,nfiles=128)
+         ! Check if restarting
+         call param_read('Restart from',restart_dir,default='')
+         restarted=(len_trim(restart_dir).gt.0)
+         ! If restarting, read header
+         if (restarted) call io%read_header(dirname=trim(restart_dir),time=restart_time,step=restart_step)
+      end block handle_restart
+
       ! Initialize time tracker
       initialize_timetracker: block
          time=timetracker(amRoot=amr%amRoot)
@@ -205,6 +225,11 @@ contains
          call param_read('Subiterations',time%itmax,default=3)
          if (time%itmax.lt.1) call die('Require at least one sub-iteration')
          time%dt=time%dtmax
+         if (restarted) then
+            call io%get_scalar('dt',time%dt)
+            time%t=restart_time
+            time%n=restart_step
+         end if
       end block initialize_timetracker
 
       ! Initialize compressible multiphase solver
@@ -248,17 +273,40 @@ contains
          call param_read('Artificial viscosity coefficient',Cartif,default=0.0_WP)
          call param_read('Max viscous CFL',max_visc_cfl,default=0.5_WP)
          if (Cartif.lt.0.0_WP.or.max_visc_cfl.le.0.0_WP) call die('Invalid artificial viscosity parameters')
-         ! Fresh start: post_regrid builds momentum from the face velocity and the primitive variables
-         call amr%init_from_scratch(time=time%t)
-         ! Phasic total energies from the internal contents written by user_init and the initial kinetic energy
-         call fs%get_total_energy(time=time%t)
-         ! Build PLIC
-         call fs%build_plic(time%t)
+         if (restarted) then
+            ! Restore grid hierarchy from checkpoint
+            call amr%init_from_checkpoint(dirname=trim(restart_dir),time=time%t)
+            ! Restore solver state
+            call fs%restore_checkpoint(io=io,dirname=trim(restart_dir),time=time%t)
+            ! Restore the monitors' reference values, which are only set at the first step
+            call io%get_scalar('Etot0',Etot0); call io%get_scalar('Kin0',Kin0)
+            call io%get_scalar('Sph0_1',Sph0(1)); call io%get_scalar('Sph0_2',Sph0(2))
+         else
+            ! Fresh start: post_regrid builds momentum from the face velocity and the primitive variables
+            call amr%init_from_scratch(time=time%t)
+            ! Phasic total energies from the internal contents written by user_init and the initial kinetic energy
+            call fs%get_total_energy(time=time%t)
+            ! Build PLIC
+            call fs%build_plic(time%t)
+         end if
          ! Set viscosities to zero
          call get_viscosities()
          ! Add artificial viscosity only
          call fs%add_viscartif(dt=time%dt,Cartif=Cartif,max_cfl=max_visc_cfl)
       end block init_grid
+
+      ! Initialize checkpoint save event
+      init_checkpoint: block
+         ! Create checkpoint save event
+         save_evt=event(time=time,name='Checkpoint')
+         call param_read('Checkpoint period',save_evt%tper,default=-1.0_WP)
+         ! Let solver self-register for checkpointing
+         call fs%register_checkpoint(io)
+         ! Add dt and the monitors' reference values to checkpoint save
+         call io%add_scalar(name='dt',value=time%dt)
+         call io%add_scalar(name='Etot0',value=Etot0); call io%add_scalar(name='Kin0',value=Kin0)
+         call io%add_scalar(name='Sph0_1',value=Sph0(1)); call io%add_scalar(name='Sph0_2',value=Sph0(2))
+      end block init_checkpoint
 
       ! Initialize visualization
       create_viz: block
@@ -295,7 +343,7 @@ contains
          call fs%get_info(); Etot=fs%Qint(3)+fs%Qint(4); if (time%n.eq.0) Etot0=Etot; dEtot=(Etot-Etot0)/Etot0; call get_tgv()
          call fs%get_cfl(dt=time%dt,cfl=time%cfl)
          ! Create simulation monitor, with the Taylor-Green diagnostics
-         mfile=monitor(amRoot=amr%amRoot,name='simulation')
+         mfile=monitor(amRoot=amr%amRoot,name='simulation',restart=restarted)
          call mfile%add_column(time%n,'Timestep number')
          call mfile%add_column(time%t,'Time')
          call mfile%add_column(time%dt,'Timestep size')
@@ -326,7 +374,7 @@ contains
          call mfile%add_column(fs%TGmax,'TGmax')
          call mfile%write()
          ! Create CFL monitor
-         cflfile=monitor(amRoot=amr%amRoot,name='cfl')
+         cflfile=monitor(amRoot=amr%amRoot,name='cfl',restart=restarted)
          call cflfile%add_column(time%n,'Timestep')
          call cflfile%add_column(time%t,'Time')
          call cflfile%add_column(time%dt,'dt')
@@ -341,7 +389,7 @@ contains
          call cflfile%add_column(fs%CFLv_z,'CFLv_z')
          call cflfile%write()
          ! Create conservation monitor
-         consfile=monitor(amRoot=amr%amRoot,name='conservation')
+         consfile=monitor(amRoot=amr%amRoot,name='conservation',restart=restarted)
          call consfile%add_column(time%n,'Timestep number')
          call consfile%add_column(time%t,'Time')
          call consfile%add_column(fs%Qint(1),'Liquid Mass')
@@ -364,7 +412,7 @@ contains
          call consfile%add_column(fs%ngate_floor,'Gate floors')
          call consfile%write()
          ! Create grid monitor
-         gridfile=monitor(amRoot=amr%amRoot,name='grid')
+         gridfile=monitor(amRoot=amr%amRoot,name='grid',restart=restarted)
          call gridfile%add_column(time%n,'Timestep')
          call gridfile%add_column(time%t,'Time')
          call gridfile%add_column(amr%nlevels,'Nlvl')
@@ -440,6 +488,14 @@ contains
             call viz%write(time=time%t)
          end if
 
+         ! Checkpoint save
+         if (save_evt%occurs()) then
+            save_checkpoint: block
+               use string, only: rtoa
+               call io%write(dirname='restart/tgv_'//trim(adjustl(rtoa(time%t))),time=time%t,step=time%n)
+            end block save_checkpoint
+         end if
+
          ! Perform and output monitoring
          call fs%get_info(); Etot=fs%Qint(3)+fs%Qint(4); if (time%n.eq.0) Etot0=Etot; dEtot=(Etot-Etot0)/Etot0; call get_tgv()
          call mfile%write()
@@ -447,6 +503,12 @@ contains
          call cflfile%write()
 
       end do
+
+      ! Force a final checkpoint on exit
+      final_checkpoint: block
+         use string, only: rtoa
+         call io%write(dirname='restart/tgv_'//trim(adjustl(rtoa(time%t))),time=time%t,step=time%n)
+      end block final_checkpoint
 
    end subroutine simulation_run
 
@@ -500,6 +562,9 @@ contains
       ! Finalize visualization
       call viz%finalize()
       call viz_evt%finalize()
+      ! Finalize checkpoint
+      call save_evt%finalize()
+      call io%finalize()
       ! Finalize monitoring
       call mfile%finalize()
       call cflfile%finalize()
