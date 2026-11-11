@@ -1,27 +1,27 @@
-# AMR grid
-Base nx:    32
-Base ny:    32
-Base nz:    32
-Max levels: 2
-
-# Regridding parameters
-Regrid nsteps:     10
-Tagging Rec:       50
-Tagging Res:       100
-
-# EoS parameters
-Gamma: 1.4
-Pinf:  0.0
+# Supersonic compressible Taylor-Green vortex from Chapelier et al. (Phys. Fluids 2024)
+# Periodic box [-pi,pi]^3, uniform mesh (no AMR)
+Base nx: 32
+Base ny: 32
+Base nz: 32
+Max level: 0
+Max grid size: 16
 
 # Flow definition
+Gamma:    1.4
 Mach:     1.25
 Reynolds: 1600
 Prandtl:  0.71
+Bulk to shear ratio: 0.0
 
-# Time integration
-Max dt:   2.5e-2
-Max CFL:  1.5
+# Do we use SGS modeling (both off, as the reference); the coefficient applies to bSGS only
+Use bSGS model: .true.
+Use sSGS model: .false.
+
+# Time integration: iterative midpoint, explicit, so Max CFL bounds the acoustic CFL (|u|+c)*dt/dx of each direction
+Max dt:   5e-2
+Max CFL:  0.5
 Max time: 20
+Subiterations: 3
 
 # Output
-Output period: 0.1
+Output period: 1.0
