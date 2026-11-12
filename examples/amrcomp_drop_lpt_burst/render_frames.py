@@ -16,7 +16,7 @@ SETTINGS = dict(
     overwrite=False,                        # True re-renders frames whose PNG already exists
     # --- execution
     np=16,                                  # number of parallel pvbatch workers
-    gl="egl",                               # "egl" = GPU, "mesa" = CPU (no GPU needed)
+    gl="egl",                               # "egl" = GPU; "mesa" = CPU (Kitware binary); "none" = OSMesa cluster builds
     pvbatch=None,                           # pvbatch for the workers; None = the one running this script
     # --- appearance
     res=[1920, 1080],                       # image width, height [px]
@@ -77,6 +77,7 @@ import argparse
 import bisect
 import glob
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -105,8 +106,9 @@ def parse_args(argv):
                     help="re-render frames whose PNG exists (%(default)s)")
     run = ap.add_argument_group("execution")
     run.add_argument("--np", type=int, help="number of parallel pvbatch workers (%(default)s)")
-    run.add_argument("--gl", choices=("egl", "mesa"),
-                     help="headless OpenGL: egl = GPU, mesa = CPU, no GPU needed (%(default)s)")
+    run.add_argument("--gl", choices=("egl", "mesa", "none"),
+                     help="headless OpenGL: egl = GPU; mesa = CPU via the Mesa bundled with Kitware binaries; "
+                          "none = no backend flag, the build's default (use for OSMesa cluster builds) (%(default)s)")
     run.add_argument("--pvbatch", help="pvbatch executable for workers (%(default)s = the one running this)")
     look = ap.add_argument_group("appearance")
     look.add_argument("--res", type=int, nargs=2, metavar=("W", "H"), help="(%(default)s)")
@@ -394,14 +396,19 @@ def master(args, argv):
     if not todo:
         return 0
 
-    pvbatch = args.pvbatch or os.path.join(os.path.dirname(sys.executable), "pvbatch")
-    if not os.access(pvbatch, os.X_OK):
-        die(f"pvbatch executable not found at {pvbatch}; pass --pvbatch")
-    backend = ["--opengl-window-backend", "EGL"] if args.gl == "egl" else ["--mesa"]
+    pvbatch = args.pvbatch                                    # else next to the running one, else on PATH
+    if not pvbatch:
+        here = os.path.join(os.path.dirname(sys.executable), "pvbatch")
+        pvbatch = here if os.access(here, os.X_OK) else shutil.which("pvbatch")
+    if not pvbatch or not os.access(pvbatch, os.X_OK):
+        die(f"pvbatch executable not found ({pvbatch}); pass --pvbatch")
+    # egl: GPU; mesa: Kitware-binary bundled Mesa; none: the build's own default (e.g. OSMesa cluster builds)
+    backend = {"egl": ["--opengl-window-backend", "EGL"], "mesa": ["--mesa"], "none": []}[args.gl]
     nw = min(args.np, len(todo))
     env = dict(os.environ)
-    if args.gl == "mesa":                                    # share CPU cores among llvmpipe workers
-        env.setdefault("LP_NUM_THREADS", str(max(1, (os.cpu_count() or 1) // nw)))
+    if args.gl != "egl":                                      # CPU rendering: share the allocated cores
+        ncpu = len(os.sched_getaffinity(0))                   # respects the batch job's CPU set
+        env.setdefault("LP_NUM_THREADS", str(max(1, ncpu // nw)))
     script = os.path.abspath(__file__)
 
     procs = []
