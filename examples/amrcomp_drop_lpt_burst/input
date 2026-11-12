@@ -16,25 +16,49 @@ Sponge radius: 3.0
 Sponge length: 1.0
 
 ###########################################
+##### CONDITIONS FOR PARZIALE Ms=2.67 #####
+###########################################
+# (preliminary as of 11/12/2026)
+# Gammas
+#GammaG: 1.4
+#GammaL: 6.12
+# Shock parameters
+#Gas Mach number: 1.254883
+#Shock location: -0.6
+# Liquid state
+#Density ratio:      235.697430
+#Liquid Mach number: 0.456447
+# Surface tension
+#Weber number:       4.07e4
+# Viscous parameters
+#Reynolds number:    1.35e5
+#Prandtl number:     0.71
+#Viscosity ratio:    32.099511
+#Diffusivity ratio:  12.904438
+#Sutherland exponent:    1.5
+#Sutherland temperature: 0.164
+###########################################
+
+###########################################
 ##### CONDITIONS FOR PARZIALE Ms=6.38 #####
 ###########################################
-# values from Chase's solver paper for consistency
+# (preliminary as of 11/12/2026)
 # Gammas
 GammaG: 1.3
 GammaL: 6.12
 # Shock parameters
-Gas Mach number: 2.064
+Gas Mach number: 2.063790
 Shock location: -0.6
 # Liquid state
-Density ratio:      127.51
-Liquid Mach number: 1.294
+Density ratio:      128.012320
+Liquid Mach number: 1.297061
 # Surface tension
-Weber number:       5.48e5
+Weber number:       6.68e5
 # Viscous parameters
-Reynolds number:    2.87e5
+Reynolds number:    3.5e5
 Prandtl number:     0.71
-Viscosity ratio:    13.71
-Diffusivity ratio:  6.5
+Viscosity ratio:    13.718386
+Diffusivity ratio:  6.495960
 Sutherland exponent:    1.5
 Sutherland temperature: 0.05
 ###########################################
@@ -114,7 +138,7 @@ PLIC Output period: 1e-1
 tau Output period [tau]: 0.25   ! In tau=t/tc, tc=sqrt(rhoL/rho2)*d0/u2 computed by the code
 Checkpoint period: 1
 Max wall time:     !14400    ! IN SECONDS
-Restart from:      restart/drop_5.00000E+00
+# Restart from:      restart/drop_5.00000E+00
 
 # ---------------------------------------------------------------------
 # Burst output (camera exposure replication, see burst_implementation.md)
