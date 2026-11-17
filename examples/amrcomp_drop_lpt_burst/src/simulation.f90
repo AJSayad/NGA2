@@ -183,6 +183,10 @@ module simulation
    integer , dimension(:), allocatable :: l_modes,m_modes
    real(WP), dimension(:), allocatable :: amp_modes,phase_modes
 
+   !> Drop shape: ellipsoid semi-axes (x,y,z) in units of d0, from 'Drop diameters' (default sphere, 0.5)
+   real(WP), dimension(3) :: drop_axes=0.5_WP
+   real(WP) :: x_lead=-0.5_WP           !< Leading-edge x of the drop (surface point on the -x axis)
+
    !> Tagging parameter
    real(WP) :: Re_tag=huge(1.0_WP)
    real(WP) :: Rho_tag=huge(1.0_WP)
@@ -213,30 +217,34 @@ contains
       Hshock=1.0_WP/(1.0_WP+exp(-x/delta))
    end function Hshock
 
-   !> Levelset function for drop (centered at x=x_drop)
-   function sphere_levelset(xyz,t) result(G)
+   !> Radial levelset of the drop centered at the origin: G = r_e(n) + sum_i a_i*Y_lm(theta,phi+psi_i) - r
+   !> r_e(n) is the ellipsoid radius along n=xyz/r (semi-axes drop_axes); reduces to 0.5+perturb-r for a sphere
+   function drop_levelset(xyz,t) result(G)
       use mathtools, only: spherical_harmonic
       real(WP), dimension(3), intent(in) :: xyz
       real(WP), intent(in) :: t
-      real(WP) :: G,r,theta,phi,perturb
+      real(WP), dimension(3) :: p
+      real(WP) :: G,r,theta,phi,perturb,re
       integer :: i
-      !G=0.5_WP-sqrt((xyz(1)-x_drop)**2+xyz(2)**2+xyz(3)**2)
-      r=sqrt((xyz(1))**2+xyz(2)**2+xyz(3)**2)
-      if (r.gt.1.0e-12_WP) then
-         theta= acos(xyz(3)/r)
-         phi  =atan2(xyz(2),xyz(1))
-      else
-         theta=0.0_WP
-         phi  =0.0_WP
+      ! Quasi-2D runs: ellipse in the x-y plane, no perturbation
+      p=xyz; if (amr%nz.eq.1) p(3)=0.0_WP
+      r=sqrt(sum(p**2))
+      if (r.le.1.0e-12_WP) then
+         G=minval(drop_axes); return
       end if
-      ! Compute perturbation
+      ! Ellipsoid radius along this direction
+      re=1.0_WP/sqrt(sum((p/(r*drop_axes))**2))
+      ! Spherical harmonics perturbation (polar axis z)
       perturb=0.0_WP
-      do i=1,nsh_modes
-         perturb=perturb+amp_modes(i)*spherical_harmonic(l_modes(i),m_modes(i),theta,phi+phase_modes(i))
-      end do
-      G=0.5_WP+perturb-r
-      if (amr%nz.eq.1) G=0.5_WP-sqrt((xyz(1))**2+xyz(2)**2) ! Enable quasi-2D runs
-   end function sphere_levelset
+      if (amr%nz.gt.1) then
+         theta=acos(max(-1.0_WP,min(1.0_WP,p(3)/r)))
+         phi  =atan2(p(2),p(1))
+         do i=1,nsh_modes
+            perturb=perturb+amp_modes(i)*spherical_harmonic(l_modes(i),m_modes(i),theta,phi+phase_modes(i))
+         end do
+      end if
+      G=re+perturb-r
+   end function drop_levelset
 
    !> Compute viscosity: Sutherland for gas, VF-weighted blend with liquid
    subroutine get_viscosities()
@@ -620,7 +628,7 @@ contains
                   ! Compute VF and barycenters from levelset
                   call initialize_volume_moments(lo=[solver%amr%xlo+real(i  ,WP)*dx,solver%amr%ylo+real(j  ,WP)*dy,solver%amr%zlo+real(k  ,WP)*dz], &
                   &                              hi=[solver%amr%xlo+real(i+1,WP)*dx,solver%amr%ylo+real(j+1,WP)*dy,solver%amr%zlo+real(k+1,WP)*dz], &
-                  &                              levelset=sphere_levelset,time=time,level=nref,VFlo=VFlo,VF=myVF,BL=BL,BG=BG)
+                  &                              levelset=drop_levelset,time=time,level=nref,VFlo=VFlo,VF=myVF,BL=BL,BG=BG)
                   ! Store volume fraction
                   pVF(i,j,k,1)=myVF
                   ! Store barycenters
@@ -1758,11 +1766,27 @@ contains
          write(message,'("[Sponge] R=",es12.5," L=",es12.5," sigma=",es12.5," Ws=",es12.5)') R_spg,L_spg,sig_spg,Ws; call log(message)
       end block init_eos_and_flow
 
+      ! Drop shape: diameters along x,y,z in units of d0, used as given (no volume rescaling)
+      initialize_drop_shape: block
+         use messager,  only: log,die
+         use string,    only: str_long
+         use mathtools, only: Pi
+         character(len=str_long) :: message
+         real(WP), dimension(3) :: Ddrop
+         call param_read('Drop diameters',Ddrop,default=[1.0_WP,1.0_WP,1.0_WP])
+         if (any(Ddrop.le.0.0_WP)) call die('[Drop shape] All three Drop diameters must be positive')
+         drop_axes=0.5_WP*Ddrop
+         write(message,'("[Drop shape] Dx,Dy,Dz=",3(es12.5,x),"(units of d0)")') Ddrop; call log(message)
+         write(message,'("[Drop shape] AR Dx/Dy=",es12.5," Dz/Dy=",es12.5)') Ddrop(1)/Ddrop(2),Ddrop(3)/Ddrop(2); call log(message)
+         write(message,'("[Drop shape] V=pi/6*DxDyDz=",es12.5," V/V_sphere(d0)=",es12.5," D_eq=",es12.5)') &
+         &  Pi/6.0_WP*product(Ddrop),product(Ddrop),product(Ddrop)**(1.0_WP/3.0_WP); call log(message)
+      end block initialize_drop_shape
+
       initialize_sph_modes: block
          use param,     only: param_read,param_exists
          use parallel,  only: amRoot,MPI_REAL_WP,comm
          use string,    only: str_long
-         use messager,  only: log
+         use messager,  only: log,die
          use mpi_f08,   only: MPI_BCAST,MPI_INTEGER
          use random,    only: random_initialize,random_uniform
          use mathtools, only: twoPi
@@ -1773,10 +1797,21 @@ contains
          call param_read('SphHarm Nmode',nsh_modes,default=0)
          if (nsh_modes.gt.0) then
             allocate(l_modes(nsh_modes),m_modes(nsh_modes),amp_modes(nsh_modes),phase_modes(nsh_modes))
-            if (param_exists('SphHarm l'))     call param_read('SphHarm l',    l_modes)
-            if (param_exists('SphHarm m'))     call param_read('SphHarm m',    m_modes)
-            if (param_exists('SphHarm amp'))   call param_read('SphHarm amp',  amp_modes)
-            if (param_exists('SphHarm phase')) call param_read('SphHarm phase',phase_modes)
+            ! All four lists are required and must hold exactly Nmode entries
+            if (param_getsize('SphHarm l')    .ne.nsh_modes) call die('[SphHarm] SphHarm l must list exactly Nmode values')
+            if (param_getsize('SphHarm m')    .ne.nsh_modes) call die('[SphHarm] SphHarm m must list exactly Nmode values')
+            if (param_getsize('SphHarm amp')  .ne.nsh_modes) call die('[SphHarm] SphHarm amp must list exactly Nmode values')
+            if (param_getsize('SphHarm phase').ne.nsh_modes) call die('[SphHarm] SphHarm phase must list exactly Nmode values')
+            call param_read('SphHarm l',    l_modes)
+            call param_read('SphHarm m',    m_modes)
+            call param_read('SphHarm amp',  amp_modes)
+            call param_read('SphHarm phase',phase_modes)
+            ! Any l>=0 is allowed; a mode is only defined for |m|<=l
+            do i=1,nsh_modes
+               if (l_modes(i).lt.0)               call die('[SphHarm] Each mode needs l>=0')
+               if (abs(m_modes(i)).gt.l_modes(i)) call die('[SphHarm] Each mode needs |m|<=l')
+            end do
+            if (amr%nz.eq.1) call log('[SphHarm] Quasi-2D run: spherical harmonics perturbation is ignored')
          else
             ! Hardcode no perturbation if no inputs are given
             nsh_modes=1
@@ -2032,7 +2067,7 @@ contains
          ! Compute viscosities
          call get_viscosities()
          ! Add SGS models
-         call fs%add_viscartif(dt=time%dt,Cvisc=2.5e-2_WP)
+         call fs%add_viscartif(dt=time%dt,Cvisc=1e-1_WP) ! AS: suggested by Chase to prevent Cabuncle phenomenon and numerical instability
          call fs%add_vreman(dt=time%dt)
          ! Compute cell-centered velocity, Umag and Mach number
          call fs%get_cell_velocity()
@@ -2231,7 +2266,20 @@ contains
          call param_read('PLIC Output period',plicviz_evt%tper)
          ! Characteristic time and tau origin, from the flow parameters (see burst_implementation.md)
          tc_sim=sqrt(rhoL1/rhoG2)*d_drop/u2
-         t_hit=(-0.5_WP*d_drop-Xs)/Ws
+         ! Leading edge: surface point on the -x axis, x=-(drop_axes(1)+perturbation at theta=pi/2,phi=pi)
+         leading_edge: block
+            use mathtools, only: Pi,spherical_harmonic
+            use messager,  only: die
+            integer :: im
+            x_lead=-drop_axes(1)
+            if (amr%nz.gt.1) then
+               do im=1,nsh_modes
+                  x_lead=x_lead-amp_modes(im)*spherical_harmonic(l_modes(im),m_modes(im),0.5_WP*Pi,Pi+phase_modes(im))
+               end do
+            end if
+            if (Xs.ge.x_lead) call die('[simulation_init] Shock location must be upstream of the drop leading edge')
+         end block leading_edge
+         t_hit=(x_lead-Xs)/Ws
          tau_period: block
             real(WP) :: tau_per
             call param_read('tau Output period [tau]',tau_per)
@@ -2244,7 +2292,7 @@ contains
             character(len=str_long) :: message
             real(WP) :: exposure,tc_exp,L_tau,L_sim
             integer :: ib
-            write(message,'("[tau] tc_sim=",es12.5," t_hit=",es12.5," (tau=0: shock at drop leading edge)")') tc_sim,t_hit; call log(message)
+            write(message,'("[tau] tc_sim=",es12.5," t_hit=",es12.5," x_lead=",es12.5," (tau=0: shock at drop leading edge)")') tc_sim,t_hit,x_lead; call log(message)
             nburst=0
             if (param_exists('Burst tau')) nburst=param_getsize('Burst tau')
             allocate(burst_tau(nburst),burst_t0(nburst),burst_t1(nburst),burst_open(nburst),burst_viz(nburst),burst_lpviz(nburst))
@@ -2755,7 +2803,7 @@ contains
 
          ! Add SGS models
          call tmr_sgs%start()
-         call fs%add_viscartif(dt=time%dt,Cvisc=2.5e-2_WP)
+         call fs%add_viscartif(dt=time%dt,Cvisc=1e-1_WP) ! AS: suggested by Chase to prevent Cabuncle phenomenon and numerical instability
          call fs%add_vreman(dt=time%dt)
          call tmr_sgs%stop()
 
