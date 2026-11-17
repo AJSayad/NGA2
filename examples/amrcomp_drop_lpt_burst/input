@@ -29,9 +29,11 @@ Sponge length: 1.0
 #Density ratio:      235.704541
 #Liquid Mach number: 0.451895
 # Surface tension
-#Weber number:       3.9101e4
+#Weber number:       3.9101e4 # use this value for ellipsoid case
+#Weber number:       3.6168e4 # use this value for equivalent sphere case
 # Viscous parameters
-#Reynolds number:    1.3212e5
+#Reynolds number:    1.3212e5 # use this value for ellipsoid case
+#Reynolds number:    1.2221e5 # use this value for equivalent sphere case
 #Prandtl number:     0.71
 #Viscosity ratio:    32.200884
 #Diffusivity ratio:  12.872889
@@ -64,9 +66,11 @@ Shock location: -0.6
 Density ratio:      128.008862
 Liquid Mach number: 1.297061
 # Surface tension
-Weber number:       7.0458e5
+# Weber number:       7.0458e5 # use this value for ellipsoid case
+Weber number:       6.595e5 # use this value for equivalanet sphere case
 # Viscous parameters
-Reynolds number:    4.133e5
+# Reynolds number:    4.133e5 # use this value for ellipsoid case
+Reynolds number:    3.868e5 # use this value for equivalent sphere case
 Prandtl number:     0.71
 Viscosity ratio:    13.704307
 Diffusivity ratio:  6.490328
