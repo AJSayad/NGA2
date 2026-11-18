@@ -18,44 +18,52 @@ Sponge length: 1.0
 ###########################################
 ##### CONDITIONS FOR PARZIALE Ms=2.67 #####
 ###########################################
-# (preliminary as of 11/12/2026)
+## (as of 11/18/2026, matches Drop 1 LaTeX notes; Ms_sim = 2.695 with GammaG = 1.3674)
+## Two runs, same drop mass, differing only in reference length L:
+##   ellipsoid run:         L = d_x   = 1.54 mm,    Drop diameters 1 1/AR 1 (AR = 1.2623)
+##   equivalent sphere run: L = D_eqv = 1.42495 mm, Drop diameters 1 1 1 (default)
 # Gammas
-#GammaG: 1.4
+#GammaG: 1.3674
 #GammaL: 6.12
 # Shock parameters
-#Gas Mach number: 1.254883
+#Gas Mach number: 1.312989
 #Shock location: -0.6
 # Liquid state
-#Density ratio:      235.704541
-#Liquid Mach number: 0.451895
+#Density ratio:      224.986223
+#Liquid Mach number: 0.460649
 # Surface tension
-#Weber number:       3.9101e4 # use this value for ellipsoid case
-#Weber number:       3.6168e4 # use this value for equivalent sphere case
+#Weber number:       4.2377e4 # ellipsoid run 
+#Weber number:       3.9211e4 # equivalent sphere run 
 # Viscous parameters
-#Reynolds number:    1.3212e5 # use this value for ellipsoid case
-#Reynolds number:    1.2221e5 # use this value for equivalent sphere case
+#Reynolds number:    1.434e5  # ellipsoid run 
+#Reynolds number:    1.327e5  # equivalent sphere run 
 #Prandtl number:     0.71
-#Viscosity ratio:    32.200884
-#Diffusivity ratio:  12.872889
+#Viscosity ratio:    32.788845
+#Diffusivity ratio:  13.107937
 #Sutherland exponent:    1.5
-#Sutherland temperature: 0.1643
+#Sutherland temperature: 0.1694
 ## --Ellipsoid-----------------------------------------------------------
-## Drop shape: ellipsoid diameters along x (flow), y, z in units of d0, used as given (default 1 1 1 = sphere)
-## Volume = pi/6*Dx*Dy*Dz (logged with V/V_sphere and D_eq); same mass as the d0 sphere only if Dx*Dy*Dz=1
-# Drop diameters: 1.0807 0.8562 1.0807
+## Drop shape: ellipsoid diameters along x (flow), y, z in units of the reference length L, used as given
+## (default 1 1 1 = sphere). Volume = pi/6*Dx*Dy*Dz. The ellipsoid run (1, 1/AR, 1) in units of d_x
+## is the experimental drop, so it has the experimental mass. Ellipsoid run only:
+# Drop diameters: 1.0 0.7922 1.0
 ## Burst output (camera exposure replication, see burst_implementation.md)
 ## Every step inside [tau_c - L/2, tau_c + L/2] writes PLIC (with ccl_id) and spray
 ## to amrviz/burst_tau_<tau_c>/. Remove 'Burst tau' to disable.
 ## tau is measured from the shock reaching the drop leading edge.
 #Burst tau:          0.25 0.5 0.75 1.0 ! Window centres
 #Burst exposure [s]: 0.2e-6            ! Camera exposure time
-#Experiment t_c [s]: 3.53e-5           ! Experimental sqrt(rhoL/rho2)*d0/u2
+#Experiment t_c [s]: 3.53e-5           ! Measured sqrt(rhoL/rho2)*d0/u2 with d0 = d_x (for ellipsoid)
+#Experiment t_c [s]: 3.264e-5          ! Measured sqrt(rhoL/rho2)*d0/u2 with d0 = D_eqv (for equivalent sphere)
 ###########################################
 
 ###########################################
 ##### CONDITIONS FOR PARZIALE Ms=6.38 #####
 ###########################################
-# (preliminary as of 11/12/2026)
+## (as of 11/18/2026, matches Drop 6 LaTeX notes; Ms_sim = 6.61 with GammaG = 1.3)
+## Two runs, same drop mass, differing only in reference length L:
+##   ellipsoid run:         L = d_x   = 1.84 mm,    Drop diameters 1 1/AR 1 (AR = 1.2185)
+##   equivalent sphere run: L = D_eqv = 1.72268 mm, Drop diameters 1 1 1 (default)
 # Gammas
 GammaG: 1.3
 GammaL: 6.12
@@ -66,20 +74,21 @@ Shock location: -0.6
 Density ratio:      128.008862
 Liquid Mach number: 1.297061
 # Surface tension
-# Weber number:       7.0458e5 # use this value for ellipsoid case
-Weber number:       6.595e5 # use this value for equivalanet sphere case
+# Weber number:       7.0458e5 # ellipsoid run 
+Weber number:       6.597e5  # equivalent sphere run 
 # Viscous parameters
-# Reynolds number:    4.133e5 # use this value for ellipsoid case
-Reynolds number:    3.868e5 # use this value for equivalent sphere case
+# Reynolds number:    4.133e5 # ellipsoid run 
+Reynolds number:    3.869e5  # equivalent sphere run
 Prandtl number:     0.71
 Viscosity ratio:    13.704307
 Diffusivity ratio:  6.490328
 Sutherland exponent:    1.5
 Sutherland temperature: 0.05
 ## --Ellipsoid-----------------------------------------------------------
-## Drop shape: ellipsoid diameters along x (flow), y, z in units of d0, used as given (default 1 1 1 = sphere)
-## Volume = pi/6*Dx*Dy*Dz (logged with V/V_sphere and D_eq); same mass as the d0 sphere only if Dx*Dy*Dz=1
-# Drop diameters: 1.068 0.876 1.068
+## Drop shape: ellipsoid diameters along x (flow), y, z in units of the reference length L, used as given
+## (default 1 1 1 = sphere). Volume = pi/6*Dx*Dy*Dz. The ellipsoid run (1, 1/AR, 1) in units of d_x
+## is the experimental drop, so it has the experimental mass. Ellipsoid run only:
+# Drop diameters: 1.0 0.8207 1.0
 ## --Burst --------------------------------------------------------------
 ## Burst output (camera exposure replication, see burst_implementation.md)
 ## Every step inside [tau_c - L/2, tau_c + L/2] writes PLIC (with ccl_id) and spray
@@ -87,7 +96,8 @@ Sutherland temperature: 0.05
 ## tau is measured from the shock reaching the drop leading edge.
 Burst tau:          0.25 0.5 0.75 1.0 ! Window centres
 Burst exposure [s]: 0.11e-6           ! Camera exposure time
-Experiment t_c [s]: 1.14e-5           ! Experimental sqrt(rhoL/rho2)*d0/u2
+# Experiment t_c [s]: 1.14e-5         ! Measured sqrt(rhoL/rho2)*d0/u2 with d0 = d_x (for ellipsoid)
+Experiment t_c [s]: 1.064e-5        ! Measured sqrt(rhoL/rho2)*d0/u2 with d0 = D_eqv (for equivalent sphere)
 ###########################################
 
 ###########################################
