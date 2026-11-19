@@ -14,7 +14,7 @@ SETTINGS = dict(
     slice_z=None,                           # slice plane z [d0]; None = domain centre. A z on a cell face is
                                             # moved up half a finest cell so every point samples one cell
     frames=None,                            # 1-based 'A', 'A:B' or 'A:B:STEP'; None = all plotfiles
-    overwrite=False,                        # True re-renders frames whose PNGs already exist
+    overwrite=True,                        # True re-renders frames whose PNGs already exist
     # --- execution
     np=4,                                   # parallel pvbatch workers (each needs ~4 GB for a 17 GB plotfile)
     gl="egl",                               # "egl" = GPU; "mesa" = CPU (Kitware binary); "none" = OSMesa cluster builds
@@ -33,12 +33,24 @@ SETTINGS = dict(
     projection="parallel",                  # None, "perspective" or "parallel"
 )
 
-# Colour map of each rendered variable (name as in the plotfile Header). Fixed ranges keep colours comparable
-# across frames. log=True uses a logarithmic colour scale (range must be > 0).
+# What to render. Plotfile variables are named as in the plotfile Header. Per entry:
+#   range     fixed colour range [min, max] (keeps colours comparable across frames)
+#   log       True for a logarithmic colour scale (range must be > 0)
+#   colormap  ParaView preset name;  invert: True reverses it
+#   title     colour-bar title;      colorbar: True shows the colour bar
+#   background  RGB (0-1) behind this field's images (default: SETTINGS background)
+#   opacity   [[value, opacity], ...] opacity transfer function (None = opaque)
 FIELDS = {
-    "RHOG": dict(range=[0.15, 1.85],  log=False, colormap="Cool to Warm", title="Gas density"),
-    "PG":   dict(range=[0.003, 0.5],  log=True,  colormap="Cool to Warm", title="Gas pressure"),
-    "TG":   dict(range=[0.13, 1.5],   log=False, colormap="Cool to Warm", title="Gas temperature"),
+    "RHOG": dict(range=[0.15, 1.85], log=False, colormap="Cool to Warm", title="Gas density"),
+    "PG":   dict(range=[0.003, 0.5], log=True,  colormap="Cool to Warm", title="Gas pressure"),
+    "TG":   dict(range=[0.13, 1.5],  log=False, colormap="Cool to Warm", title="Gas temperature"),
+    # Numerical schlieren (Johnsen 2009), computed on the slice from RHOG, RHOL and VF:
+    #   phi = exp(-beta*|grad rho|/norm),  beta = K_liquid*VF + K_gas*(1-VF),  rho = VF*RHOL + (1-VF)*RHOG
+    # |grad rho| is the in-plane gradient in simulation units, evaluated on each AMR level's own cells.
+    "SCHLIEREN": dict(kind="schlieren", K_liquid=5e3, K_gas=1.5e4, norm=2.5e5, # values currently set for drop 6
+                      range=[0.0, 1.0], log=False, colormap="X Ray", invert=True, title="Numerical schlieren",
+                      colorbar=False, background=[1.0, 1.0, 1.0],
+                      opacity=[[0.0, 1.0], [1.0, 0.0]]),   # phi=0 (strong gradient) opaque, phi=1 transparent
 }
 # =============================================================================================================
 
@@ -49,7 +61,8 @@ Data
   --data is a folder of plt.nga2.cell.* plotfiles (particle plotfiles in the same folder are ignored) or one
   plotfile folder. Frames are the plotfiles in time order; times come from each plotfile's Header. All AMR
   levels are read (only the rendered variables), and the plane is cut with ParaView's AMR-aware
-  AxisAlignedSlice, which skips coarse cells covered by finer levels.
+  AxisAlignedSlice, which skips coarse cells covered by finer levels. Derived fields (FIELDS entries with a
+  'kind', e.g. the numerical schlieren) are computed on the slice's own AMR cells only.
 
 Output
   <out>/<FIELD>_slice/frame_NNNNNN_t<time>.png for every field, <out>/frames.txt (frame -> time, plotfile),
@@ -83,27 +96,60 @@ def die(msg):
     sys.exit(2)
 
 
+FIELD_KEYS = {"range", "log", "colormap", "invert", "title", "colorbar", "background", "opacity"}
+DERIVED = {"schlieren": dict(keys={"kind", "K_liquid", "K_gas", "norm"}, needs=["RHOG", "RHOL", "VF"])}
+
+
 def check_fields_table():
-    """Validate FIELDS once; return it with ranges as floats."""
+    """Validate FIELDS once; return normalised specs (floats, defaults filled, 'needs' = plotfile variables)."""
     if not isinstance(FIELDS, dict) or not FIELDS:
-        die("FIELDS must be a non-empty dict of {variable: dict(range=..., log=..., colormap=..., title=...)}")
+        die("FIELDS must be a non-empty dict of {name: dict(range=..., ...)}")
     out = {}
     for name, spec in FIELDS.items():
-        if not isinstance(spec, dict) or set(spec) - {"range", "log", "colormap", "title"}:
-            die(f"FIELDS['{name}'] must be a dict with keys range, log, colormap, title")
+        kind = spec.get("kind") if isinstance(spec, dict) else None
+        if kind is not None and kind not in DERIVED:
+            die(f"FIELDS['{name}']['kind'] = {kind!r}: known kinds are {sorted(DERIVED)}")
+        allowed = FIELD_KEYS | (DERIVED[kind]["keys"] if kind else set())
+        if not isinstance(spec, dict) or set(spec) - allowed:
+            die(f"FIELDS['{name}'] has unknown key(s) {sorted(set(spec) - allowed) if isinstance(spec, dict) else ''}; "
+                f"allowed: {sorted(allowed)}")
         try:
             lo, hi = (float(v) for v in spec["range"])
         except (KeyError, TypeError, ValueError):
             die(f"FIELDS['{name}']['range'] must be [min, max]")
+        for key in ("log", "invert", "colorbar"):
+            if not isinstance(spec.get(key, False), bool):
+                die(f"FIELDS['{name}']['{key}'] must be True or False")
         log = spec.get("log", False)
-        if not isinstance(log, bool):
-            die(f"FIELDS['{name}']['log'] must be True or False")
         if not lo < hi:
             die(f"FIELDS['{name}']['range'] = {spec['range']}: min must be < max")
         if log and lo <= 0:
             die(f"FIELDS['{name}']: a log colour scale needs a range > 0, got {spec['range']}")
-        out[name] = dict(range=[lo, hi], log=log, colormap=str(spec.get("colormap", "Cool to Warm")),
-                         title=str(spec.get("title", name)))
+        bg = spec.get("background")
+        if bg is not None and (not isinstance(bg, (list, tuple)) or len(bg) != 3
+                               or any(not isinstance(c, (int, float)) or not 0 <= c <= 1 for c in bg)):
+            die(f"FIELDS['{name}']['background'] must be [R, G, B] in 0-1")
+        opacity = spec.get("opacity")
+        if opacity is not None:
+            try:
+                opacity = sorted([float(v), float(o)] for v, o in opacity)
+            except (TypeError, ValueError):
+                die(f"FIELDS['{name}']['opacity'] must be [[value, opacity], ...]")
+            if len(opacity) < 2 or any(not 0 <= o <= 1 for _, o in opacity):
+                die(f"FIELDS['{name}']['opacity'] needs >= 2 points with opacity in 0-1")
+        norm = dict(range=[lo, hi], log=log, colormap=str(spec.get("colormap", "Cool to Warm")),
+                    invert=spec.get("invert", False), title=str(spec.get("title", name)),
+                    colorbar=spec.get("colorbar", True), background=list(bg) if bg is not None else None,
+                    opacity=opacity, kind=kind, needs=[name])
+        if kind == "schlieren":
+            try:
+                norm.update(K_liquid=float(spec["K_liquid"]), K_gas=float(spec["K_gas"]), norm=float(spec["norm"]))
+            except (KeyError, TypeError, ValueError):
+                die(f"FIELDS['{name}'] (schlieren) needs numeric K_liquid, K_gas and norm")
+            if norm["norm"] <= 0 or norm["K_liquid"] < 0 or norm["K_gas"] < 0:
+                die(f"FIELDS['{name}']: norm must be > 0 and K_liquid, K_gas >= 0")
+            norm["needs"] = list(DERIVED[kind]["needs"])
+        out[name] = norm
     return out
 
 
@@ -195,6 +241,8 @@ def parse_args(argv):
         die(f"--fields lists a variable twice: {names}")
     args.fields = names
     args.field_spec = {n: table[n] for n in names}
+    args.read_vars = list(dict.fromkeys(v for n in names for v in table[n]["needs"]))   # plotfile variables to read
+    args.derived = [n for n in names if table[n]["kind"]]
     return args
 
 
@@ -252,7 +300,7 @@ def build_frames(args):
         die(f"--data {path}: no AMReX field plotfiles found")
     items.sort(key=lambda it: it[0])
     for t, pf, hdr in items:
-        missing = [f for f in args.fields if f not in hdr["names"]]
+        missing = [f for f in args.read_vars if f not in hdr["names"]]
         if missing:
             die(f"{pf}: variable(s) {missing} not in this plotfile; it has {hdr['names']}")
     tags = [time_tag(t) for t, _, _ in items]
@@ -458,6 +506,93 @@ def master(args, argv):
     return 1 if (missing or bad_workers) else 0
 
 
+# ------------------------------------------------------------------------------------- derived slice fields
+# Computed here in the worker, not in a ParaView ProgrammableFilter: that filter runs its script in __main__
+# and star-imports numpy helpers there, replacing this script's built-in min/max/abs/sum/all/any.
+def derived_slice(slice_amr, hdr, specs):
+    """Return a copy of the AMR slice with every requested derived field added as cell data."""
+    out = slice_amr.NewInstance()
+    out.DeepCopy(slice_amr)                                        # the slice is small; never touch upstream data
+    for name, spec in specs.items():
+        if spec["kind"] == "schlieren":
+            schlieren_on_slice(out, hdr, name, spec)
+    return out
+
+
+def _prolong(c, ry, rx):
+    """Linear prolongation of cell-centred c (ny, nx) to a grid refined by (ry, rx), clamped at the domain edge."""
+    import numpy as np
+
+    def along(a, axis, r):
+        n = a.shape[axis]
+        p = (np.arange(n * r) + 0.5) / r - 0.5                     # fine centres in coarse index units
+        f = np.floor(p)
+        i0 = np.clip(f.astype(int), 0, n - 1)
+        i1 = np.clip(f.astype(int) + 1, 0, n - 1)
+        w = np.where(f < 0, 0.0, p - f)
+        shape = [1, 1]
+        shape[axis] = -1
+        w = w.reshape(shape)
+        return np.take(a, i0, axis=axis) * (1.0 - w) + np.take(a, i1, axis=axis) * w
+
+    return along(along(c, 0, ry), 1, rx)
+
+
+def schlieren_on_slice(amr, hdr, name, spec):
+    """Numerical schlieren on the native cells of an AMR slice (constant z), level by level.
+
+    For each level a full-plane array is built from that level's patches; where the level has no data it is
+    filled by linear prolongation of the next coarser level (as AMR ghost filling does). Central differences
+    at the level's own spacing then give |grad rho| for every cell, without resampling the output.
+    """
+    import numpy as np
+    from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk
+
+    xlo, ylo = hdr["lo"][0], hdr["lo"][1]
+    dxs = [(d[0], d[1]) for d in hdr["dx"]]
+    blocks = {}
+    it = amr.NewIterator()
+    it.InitTraversal()
+    while not it.IsDoneWithTraversal():
+        ds = it.GetCurrentDataObject()
+        sx = ds.GetSpacing()[0]
+        lev = min(range(len(dxs)), key=lambda L: abs(dxs[L][0] - sx))
+        if abs(dxs[lev][0] - sx) > 1e-6 * sx:
+            raise RuntimeError(f"slice block spacing {sx} matches no level of the plotfile")
+        blocks.setdefault(lev, []).append(ds)
+        it.GoToNextItem()
+    KL, KG, norm = spec["K_liquid"], spec["K_gas"], spec["norm"]
+    F = V = None
+    for L in range(max(blocks) + 1):
+        dx, dy = dxs[L]
+        nx = int(round((hdr["hi"][0] - xlo) / dx))
+        ny = int(round((hdr["hi"][1] - ylo) / dy))
+        if F is None:
+            F, V = np.zeros((ny, nx)), np.zeros((ny, nx))
+        else:
+            rx, ry = int(round(dxs[L - 1][0] / dx)), int(round(dxs[L - 1][1] / dy))
+            F, V = _prolong(F, ry, rx), _prolong(V, ry, rx)
+            if F.shape != (ny, nx):
+                raise RuntimeError(f"level {L} plane {F.shape} does not match the domain {(ny, nx)}")
+        placed = []
+        for ds in blocks.get(L, []):
+            d, o = ds.GetDimensions(), ds.GetOrigin()
+            bx, by = d[0] - 1, d[1] - 1
+            i0, j0 = int(round((o[0] - xlo) / dx)), int(round((o[1] - ylo) / dy))
+            cd = ds.GetCellData()
+            vf = vtk_to_numpy(cd.GetArray("VF"))
+            rho = vf * vtk_to_numpy(cd.GetArray("RHOL")) + (1.0 - vf) * vtk_to_numpy(cd.GetArray("RHOG"))
+            F[j0:j0 + by, i0:i0 + bx] = rho.reshape(by, bx)
+            V[j0:j0 + by, i0:i0 + bx] = vf.reshape(by, bx)
+            placed.append((ds, i0, j0, bx, by))
+        gy, gx = np.gradient(F, dy, dx)
+        phi = np.exp(-(KL * V + KG * (1.0 - V)) * np.hypot(gx, gy) / norm)
+        for ds, i0, j0, bx, by in placed:
+            arr = numpy_to_vtk(np.ascontiguousarray(phi[j0:j0 + by, i0:i0 + bx]).ravel(), deep=1)
+            arr.SetName(name)
+            ds.GetCellData().AddArray(arr)
+
+
 # ----------------------------------------------------------------------------------------------- worker
 def worker(args):
     from paraview import simple as pv
@@ -482,12 +617,20 @@ def worker(args):
     reader = pv.AMReXBoxLibGridReader(FileNames=[mine[0]["plotfile"]])     # ParaView 6: FileNames list
     reader.UpdatePipelineInformation()
     reader.Level = mine[0]["header"]["finest"]                     # default reads only levels 0-1
-    reader.CellArrayStatus = list(args.fields)                     # read only the rendered variables
+    reader.CellArrayStatus = list(args.read_vars)                  # read only the variables needed
     cut = pv.AxisAlignedSlice(Input=reader)                        # AMR aware: skips covered coarse cells
     cut.CutFunction.Normal = [0.0, 0.0, 1.0]
     cut.CutFunction.Origin = [0.0, 0.0, mine[0]["z"]]
     cut.Level = mine[0]["header"]["finest"]                        # default slices level 0 only
-    rep = pv.Show(cut, view)
+    shown = cut
+    if args.derived:                                               # derived fields computed on the slice only
+        producer = pv.TrivialProducer()                            # hands the worker-computed slice to the view
+        cut.UpdatePipeline()
+        producer.GetClientSideObject().SetOutput(
+            derived_slice(cut.GetClientSideObject().GetOutputDataObject(0), mine[0]["header"],
+                          {n: args.field_spec[n] for n in args.derived}))
+        shown = producer
+    rep = pv.Show(shown, view)
     rep.Representation = "Surface"
     rep.Ambient, rep.Diffuse, rep.Specular = 1.0, 0.0, 0.0         # unlit: pixels show the colour map exactly
 
@@ -511,11 +654,21 @@ def worker(args):
         lut.UseLogScale = 0
         lut.ApplyPreset(s["colormap"], True)
         lut.RescaleTransferFunction(*s["range"])
+        if s["invert"]:
+            lut.InvertTransferFunction()
         if s["log"]:
             lut.MapControlPointsToLogSpace()
             lut.UseLogScale = 1
+        if s["opacity"]:
+            pwf = pv.GetOpacityTransferFunction(name)
+            pwf.Points = [v for x, o in s["opacity"] for v in (x, o, 0.5, 0.0)]
+            lut.ScalarOpacityFunction = pwf
+            lut.EnableOpacityMapping = 1
+        else:
+            lut.EnableOpacityMapping = 0
         for other, (_, b) in luts.items():
-            b.Visibility = int(other == name)
+            b.Visibility = int(other == name and s["colorbar"])
+        view.Background = s["background"] or list(args.background)
         return lut
 
     pv.Render(view)                                                  # first render may reset the camera,
@@ -535,12 +688,18 @@ def worker(args):
             reader.FileNames = [fr["plotfile"]]
             reader.UpdatePipelineInformation()
             reader.Level = fr["header"]["finest"]
-            reader.CellArrayStatus = list(args.fields)
+            reader.CellArrayStatus = list(args.read_vars)
             cut.CutFunction.Origin = [0.0, 0.0, fr["z"]]
             cut.Level = fr["header"]["finest"]
             cut.UpdatePipeline()
             if cut.GetDataInformation().GetNumberOfCells() == 0:
                 raise RuntimeError(f"slice at z={fr['z']} is empty")
+            if args.derived:
+                producer.GetClientSideObject().SetOutput(
+                    derived_slice(cut.GetClientSideObject().GetOutputDataObject(0), fr["header"],
+                                  {n: args.field_spec[n] for n in args.derived}))
+                producer.MarkModified(producer)
+                producer.UpdatePipeline()
             for name in args.fields:
                 lut = color_by(name)
                 lo, hi = args.field_spec[name]["range"]

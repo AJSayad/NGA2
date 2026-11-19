@@ -8,9 +8,9 @@
 # None means "not set". Each key matches the flag of the same name (underscores <-> dashes).
 SETTINGS = dict(
     # --- data
-    plic="amrviz/burst_tau_2.50000E-01",    # PLIC folder (plic.pvd + plic_*.vtp) or .pvd file; None = no PLIC
-    spray="amrviz/burst_tau_2.50000E-01",   # folder of plt.part.* plotfiles; None = no particles
-    out="frames/tau0.25",                   # output folder for the PNGs
+    plic="amrviz/plic",    # PLIC folder (plic.pvd + plic_*.vtp) or .pvd file; None = no PLIC
+    spray="amrviz/spray",   # folder of plt.part.* plotfiles; None = no particles
+    out="frames/",                   # output folder for the PNGs
     frames=None,                            # 1-based 'A', 'A:B' or 'A:B:STEP'; None = all frames
     time_tol=1e-6,                          # PLIC/spray time match tolerance, relative to max(1,|t|)
     overwrite=False,                        # True re-renders frames whose PNG already exists
